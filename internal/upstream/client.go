@@ -6,8 +6,9 @@
 // not sent either: the arguments the model made and the name of the tool, the protocol envelope (the version and
 // empty client capabilities, as idp-mcp's gateway sends to an external target, ADR-0001 D51 b) and the progress token
 // the caller sent; the request headers are Content-Type, Accept, MCP-Protocol-Version, Mcp-Method, Mcp-Name, the
-// member's own token for the third party if there is one, and a fixed User-Agent. Nothing of the caller (no assertion,
-// no tenant or member, no clientInfo), no trace headers, no Mcp-Param-* headers.
+// member's own token for the third party if there is one, a fixed User-Agent, and the Mcp-Param-* headers the tool's definition
+// asks for, computed from the arguments (paramheaders.go). Nothing of the caller (no assertion, no tenant or member, no
+// clientInfo), no trace headers, and no header copied from the gateway's request.
 //
 // What it accepts is bounded and judged: a plain answer up to MaxResult bytes, a stream up to MaxStream bytes in all
 // and MaxResult for one event; a request the third party makes of the client (sampling, elicitation, roots, input
@@ -174,6 +175,12 @@ func ValidName(name string) bool {
 // CallTool sends tools/call with the arguments and the progress token. token is the member's credential for this
 // third party, or "" for a connection that needs none.
 func (c *Client) CallTool(ctx context.Context, token, name string, args, progress json.RawMessage) (Reply, error) {
+	return c.CallToolWithHeaders(ctx, token, name, args, progress, nil)
+}
+
+// CallToolWithHeaders is CallTool with the Mcp-Param-* headers the tool's definition asks for (ParamHeaders). Only headers of that
+// family are sent: anything else in extra is dropped, so that it cannot become a way to send something the allow-list does not.
+func (c *Client) CallToolWithHeaders(ctx context.Context, token, name string, args, progress json.RawMessage, extra http.Header) (Reply, error) {
 	if !ValidName(name) {
 		return Reply{}, ErrBadName
 	}
@@ -182,7 +189,7 @@ func (c *Client) CallTool(ctx context.Context, token, name string, args, progres
 	}
 	n, _ := json.Marshal(name)
 	params := map[string]json.RawMessage{"name": n, "arguments": args, "_meta": mustJSON(envelope(progress))}
-	res, read, err := c.do(ctx, token, "tools/call", name, params)
+	res, read, err := c.do(ctx, token, "tools/call", name, params, extra)
 	if err != nil {
 		return Reply{Bytes: read}, err
 	}
@@ -204,7 +211,7 @@ func (c *Client) ListTools(ctx context.Context, token string) (Reply, error) {
 		if cursor != "" {
 			params["cursor"], _ = json.Marshal(cursor)
 		}
-		res, read, err := c.do(ctx, token, "tools/list", "", params)
+		res, read, err := c.do(ctx, token, "tools/list", "", params, nil)
 		total += read
 		if err != nil {
 			return Reply{Bytes: total}, err
@@ -255,7 +262,7 @@ func headerValue(v string) string {
 }
 
 // do sends one request and returns its result object and how many bytes of the answer were read.
-func (c *Client) do(ctx context.Context, token, method, name string, params map[string]json.RawMessage) (json.RawMessage, int64, error) {
+func (c *Client) do(ctx context.Context, token, method, name string, params map[string]json.RawMessage, extra http.Header) (json.RawMessage, int64, error) {
 	body, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": json.Number(requestID), "method": method, "params": params})
 	if err != nil {
 		return nil, 0, err
@@ -273,6 +280,11 @@ func (c *Client) do(ctx context.Context, token, method, name string, params map[
 		h.Set("Mcp-Name", headerValue(name))
 	}
 	h.Set("User-Agent", userAgent)
+	for k, vs := range extra {
+		if strings.HasPrefix(http.CanonicalHeaderKey(k), paramPrefix) && len(vs) == 1 {
+			h.Set(k, vs[0])
+		}
+	}
 	if token != "" {
 		h.Set("Authorization", "Bearer "+token)
 	}

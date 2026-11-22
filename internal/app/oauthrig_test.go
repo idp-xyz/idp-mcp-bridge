@@ -119,6 +119,7 @@ connections:
       issuer: %[2]s
       client: {mode: cimd, document: "%[3]s/clients/notes.json"}
       scopes: [read]
+      reviewerScopes: [list]
   - id: svc
     title: Open service
     endpoint: %[1]s
@@ -169,7 +170,7 @@ func newORig(t *testing.T, o orgOpts) *orig {
 	log := slog.New(slog.NewJSONHandler(r.log, nil))
 	r.svc = &oauth.Service{Connections: cs, RedirectURI: redirectURI, Store: r.store, Sealer: r.keys, F: f, Log: log,
 		Disc: &oauth.Discoverer{F: f, Probe: Prober(cs, hc, opts)}}
-	opts.Deps = bridge.Deps{Tokens: r.svc, Reviewer: auth.NoReviewer{}, Log: log, Metrics: r.met}
+	opts.Deps = bridge.Deps{Tokens: r.svc, Reviewer: oauth.ReviewerSource{S: r.svc}, Log: log, Metrics: r.met}
 	if r.mcp, err = Handler(cs, opts); err != nil {
 		t.Fatal(err)
 	}
@@ -177,15 +178,16 @@ func newORig(t *testing.T, o orgOpts) *orig {
 	return r
 }
 
-// testAuthenticator takes "Bearer m:<tenant>:<member>" for the token the Workspace would send.
+// testAuthenticator takes "Bearer m:<tenant>:<member>" for the token the Workspace would send, and "r:<tenant>:<member>" for the
+// token of a member who has the reviewer role.
 type testAuthenticator struct{}
 
 func (testAuthenticator) Authenticate(_ context.Context, bearer string) (auth.Subject, error) {
 	p := strings.Split(bearer, ":")
-	if len(p) != 3 || p[0] != "m" {
+	if len(p) != 3 || (p[0] != "m" && p[0] != "r") {
 		return auth.Subject{}, api.ErrUnauthenticated
 	}
-	return auth.Subject{Tenant: p[1], Member: p[2]}, nil
+	return auth.Subject{Tenant: p[1], Member: p[2], Reviewer: p[0] == "r"}, nil
 }
 
 func (r *orig) record(body string) {
@@ -200,8 +202,17 @@ func (r *orig) callAPI(method, path, member, body string) (int, map[string]any) 
 }
 
 func (r *orig) callAPIAs(method, path, tenant, member, body string) (int, map[string]any) {
+	return r.callAPIKind(method, path, "m", tenant, member, body)
+}
+
+// callAPIReviewer calls the API as an operator whose token carries the reviewer role.
+func (r *orig) callAPIReviewer(method, path, member, body string) (int, map[string]any) {
+	return r.callAPIKind(method, path, "r", "acme", member, body)
+}
+
+func (r *orig) callAPIKind(method, path, kind, tenant, member, body string) (int, map[string]any) {
 	req := httptest.NewRequest(method, "/internal/v1/connections"+path, strings.NewReader(body))
-	req.Header.Set("Authorization", "Bearer m:"+tenant+":"+member)
+	req.Header.Set("Authorization", "Bearer "+kind+":"+tenant+":"+member)
 	w := httptest.NewRecorder()
 	r.api.ServeHTTP(w, req)
 	if !(strings.HasSuffix(path, "/authorization") && w.Code == 200) { // the authorization URL carries the state and the challenge by design
@@ -236,6 +247,28 @@ func (r *orig) connectAs(tenant, member, conn string) (int, map[string]any) {
 func (r *orig) call(conn, tenant, member, tool string) (*httptest.ResponseRecorder, map[string]any) {
 	r.t.Helper()
 	w, m := mcptest.Post(r.mcp, Path(conn), r.gw.CallBody(Audience(base, conn), member, tenant, tool, `{}`, ""), nil)
+	r.record(w.Body.String())
+	return w, m
+}
+
+// authorizeReviewer runs the whole authorization of a connection's reviewer account as an operator.
+func (r *orig) authorizeReviewer(operator string) (int, map[string]any) {
+	r.t.Helper()
+	code, m := r.callAPIReviewer("POST", "/notes/reviewer/authorization", operator, "")
+	if code != 200 {
+		return code, m
+	}
+	back, err := asdouble.Consent(m["url"].(string), "reviewer-account") // the account at the third party is its own user
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	body, _ := json.Marshal(map[string]string{"code": back.Get("code"), "state": back.Get("state"), "iss": back.Get("iss")})
+	return r.callAPIReviewer("POST", "/notes/callback", operator, string(body))
+}
+
+// list is the gateway's tools/list of a connection (no member).
+func (r *orig) list(conn string) (*httptest.ResponseRecorder, map[string]any) {
+	w, m := mcptest.Post(r.mcp, Path(conn), mcptest.ListBody(), nil)
 	r.record(w.Body.String())
 	return w, m
 }

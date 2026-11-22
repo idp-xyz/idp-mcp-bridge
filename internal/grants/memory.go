@@ -58,7 +58,7 @@ func (m *Memory) DeleteMember(_ context.Context, tenant, member string) (int, er
 	defer m.mu.Unlock()
 	n := 0
 	for k := range m.grants {
-		if k.Tenant == tenant && k.Member == member {
+		if !k.Reviewer && k.Tenant == tenant && k.Member == member {
 			delete(m.grants, k)
 			n++
 		}
@@ -84,7 +84,7 @@ func (m *Memory) ForMember(_ context.Context, tenant, member string) ([]Grant, e
 	defer m.mu.Unlock()
 	var out []Grant
 	for k, g := range m.grants {
-		if k.Tenant == tenant && k.Member == member {
+		if !k.Reviewer && k.Tenant == tenant && k.Member == member {
 			out = append(out, clone(g))
 		}
 	}

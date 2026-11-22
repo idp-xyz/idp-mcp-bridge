@@ -181,3 +181,19 @@ func TestLoadChecksThatTheSecretFileCanBeRead(t *testing.T) {
 		t.Fatal("no path")
 	}
 }
+
+func TestReviewerScopesAreOptionalCheckedLikeScopesAndForbiddenWithoutOAuth(t *testing.T) {
+	cs, err := Parse([]byte(strings.Replace(good, "scopes: [repo, read:org]", "scopes: [repo, read:org]\n      reviewerScopes: [read:org]", 1)), Options{})
+	if err != nil || len(cs[0].Authorization.ReviewerScopes) != 1 || cs[0].Authorization.ReviewerScopes[0] != "read:org" {
+		t.Fatalf("%v", err)
+	}
+	for name, mod := range map[string]string{"a duplicate": "[a, a]", "a space": `["a b"]`, "an empty one": `[""]`} {
+		_, err := Parse([]byte(strings.Replace(good, "scopes: [repo, read:org]", "scopes: [repo]\n      reviewerScopes: "+mod, 1)), Options{})
+		if err == nil || !strings.Contains(err.Error(), "reviewerScopes") {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	if _, err := Parse([]byte(`connections: [{id: a, title: A, endpoint: "https://a.example.com/mcp", authorization: {mode: none, reviewerScopes: [x]}}]`), Options{}); err == nil {
+		t.Error("reviewerScopes for a connection that needs no token")
+	}
+}

@@ -183,3 +183,51 @@ func TestTheVerifierIsTheAPIsAuthenticatorAndAnUnauthenticatedCallIs401(t *testi
 		t.Fatal(c)
 	}
 }
+
+// ADR-0001 D33: who may authorize reviewer accounts is a realm role (and, if configured, a tenant), with no default.
+func TestTheReviewerRoleAndTenantMakeAReviewerAndNothingElseDoes(t *testing.T) {
+	r := newRealm(t)
+	tok := func(mod func(jwt.MapClaims)) string {
+		return sign(t, jwt.SigningMethodRS256, r.rsa, "rsa1", claims(mod))
+	}
+	roles := func(rs ...string) func(jwt.MapClaims) { return func(c jwt.MapClaims) { c["roles"] = rs } }
+	who := func(v *Verifier, token string) auth.Subject {
+		s, err := v.Authenticate(context.Background(), token)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	v := r.verifier()
+	if who(v, tok(roles("idp-reviewer"))).Reviewer {
+		t.Fatal("with no role configured, no one is a reviewer")
+	}
+	v.ReviewerRole = "idp-reviewer"
+	for name, c := range map[string]struct {
+		mod  func(jwt.MapClaims)
+		want bool
+	}{
+		"the role":                      {roles("host-user", "idp-reviewer"), true},
+		"another role":                  {roles("host-user", "idp-reviewer-x"), false},
+		"no roles claim":                {nil, false},
+		"roles that are not a list":     {func(c jwt.MapClaims) { c["roles"] = "idp-reviewer" }, false},
+		"a list that is not of strings": {func(c jwt.MapClaims) { c["roles"] = []any{5, nil} }, false},
+	} {
+		if got := who(v, tok(c.mod)).Reviewer; got != c.want {
+			t.Errorf("%s: %v", name, got)
+		}
+	}
+	// the tenant narrows it
+	v.ReviewerTenant = "acme"
+	if !who(v, tok(roles("idp-reviewer"))).Reviewer {
+		t.Fatal("the tenant of the operators")
+	}
+	if who(v, tok(func(c jwt.MapClaims) { c["roles"] = []string{"idp-reviewer"}; c["tenant_id"] = "other" })).Reviewer {
+		t.Fatal("the role of another tenant")
+	}
+	// the claim is configurable
+	v.RolesClaim = "realm_roles"
+	if who(v, tok(roles("idp-reviewer"))).Reviewer || !who(v, tok(func(c jwt.MapClaims) { c["realm_roles"] = []string{"idp-reviewer"} })).Reviewer {
+		t.Fatal("the roles claim")
+	}
+}

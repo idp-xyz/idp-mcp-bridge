@@ -97,7 +97,11 @@ func (k *Keys) Current() string { return k.current }
 // aad binds a ciphertext to its owner and its key: length-prefixed so that ("ab","c") and ("a","bc") differ.
 func aad(o grants.Key, keyID string) []byte {
 	var b []byte
-	for _, s := range []string{"idp-mcp-bridge/v1", o.Tenant, o.Member, o.Connection, keyID} {
+	kind := "member"
+	if o.Reviewer {
+		kind = "reviewer" // a reviewer grant never opens as a member's, nor the other way round (ADR-0001 D33)
+	}
+	for _, s := range []string{"idp-mcp-bridge/v1", o.Tenant, o.Member, o.Connection, kind, keyID} {
 		b = append(b, byte(len(s)>>8), byte(len(s)))
 		b = append(b, s...)
 	}

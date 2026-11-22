@@ -93,6 +93,9 @@ type Authorization struct {
 	Client Client `yaml:"client"`
 	// Scopes are requested as written, in order. B2 asks for more only when the third party says so.
 	Scopes []string `yaml:"scopes"`
+	// ReviewerScopes are what the connection's reviewer account is authorized for: the least that lets it list the tools
+	// (ADR-0001 D33). If empty, Scopes.
+	ReviewerScopes []string `yaml:"reviewerScopes"`
 }
 
 // Client is the bridge's identity at the authorization server.
@@ -251,7 +254,7 @@ func publicHTTPS(key, raw string, o Options, query bool) (addr.Address, error) {
 func (a *Authorization) validate(o Options) error {
 	switch a.Mode {
 	case AuthNone:
-		if a.Issuer != "" || a.Client != (Client{}) || len(a.Scopes) > 0 {
+		if a.Issuer != "" || a.Client != (Client{}) || len(a.Scopes) > 0 || len(a.ReviewerScopes) > 0 {
 			return errors.New("mode none takes no issuer, client or scopes: they would be ignored, and an ignored line is a wrong belief")
 		}
 		return nil
@@ -271,19 +274,24 @@ func (a *Authorization) validate(o Options) error {
 	if err := a.Client.validate(o); err != nil {
 		return fmt.Errorf("client: %w", err)
 	}
-	if len(a.Scopes) > maxScopes {
-		return fmt.Errorf("more than %d scopes", maxScopes)
-	}
-	seen := map[string]bool{}
-	for _, s := range a.Scopes {
-		// RFC 6749 section 3.3: printable ASCII without space, double quote and backslash
-		if s == "" || len(s) > maxScope || strings.ContainsFunc(s, func(r rune) bool { return r < 0x21 || r > 0x7e || r == '"' || r == '\\' }) {
-			return fmt.Errorf("scope %q is not a valid scope token", s)
+	for _, list := range []struct {
+		key    string
+		scopes []string
+	}{{"scopes", a.Scopes}, {"reviewerScopes", a.ReviewerScopes}} {
+		if len(list.scopes) > maxScopes {
+			return fmt.Errorf("more than %d %s", maxScopes, list.key)
 		}
-		if seen[s] {
-			return fmt.Errorf("scope %q is listed twice", s)
+		seen := map[string]bool{}
+		for _, s := range list.scopes {
+			// RFC 6749 section 3.3: printable ASCII without space, double quote and backslash
+			if s == "" || len(s) > maxScope || strings.ContainsFunc(s, func(r rune) bool { return r < 0x21 || r > 0x7e || r == '"' || r == '\\' }) {
+				return fmt.Errorf("%s: %q is not a valid scope token", list.key, s)
+			}
+			if seen[s] {
+				return fmt.Errorf("%s: scope %q is listed twice", list.key, s)
+			}
+			seen[s] = true
 		}
-		seen[s] = true
 	}
 	return nil
 }

@@ -2,7 +2,7 @@
 
 | 项 | 内容 |
 |---|---|
-| 状态 | 已接受（2026-11-22，随任务 B1；外联桥计划第 5 节）。D25 在 B2 评审后改为所有者与应用角色分开。D21 到 D32 随任务 B2（OAuth、授权库、Workspace 的内部 API）；B3（评审账号）在它之上增补，D13 的 `ReviewerSource` 是它的接入点。D15（存储接口）与 D16（内部 API）在 B2 里实现，细节以 D24 到 D30 为准 |
+| 状态 | 已接受（2026-11-22，随任务 B1；外联桥计划第 5 节）。D25 在 B2 评审后改为所有者与应用角色分开。D33、D34 随任务 B3（评审账号、`Mcp-Param-*` 头）。D21 到 D32 随任务 B2（OAuth、授权库、Workspace 的内部 API）；B3（评审账号）在 D33 实现，D13 的 `ReviewerSource` 是它的接入点。D15（存储接口）与 D16（内部 API）在 B2 里实现，细节以 D24 到 D30 为准 |
 | 范围 | `idp-mcp-bridge` 的技术栈、连接配置、对网关的 MCP 端点与调用者校验、对第三方的 MCP 客户端（发什么、收什么）、地址规则与出口、限流与熔断、"需要授权"的答复、为 B2 留的接口、审计与指标、部署 |
 | 依据 | B2：RFC 6749、6750、7009、7591、7636、8414、8707、9207、9728，OpenID Connect Discovery 1.0，OAuth Client ID Metadata Document（草案），MCP 2026-07-28 授权部分（规范页本机取不到，以官方 Python SDK 2026-10-13 的客户端为参照读过，不抄：`idp-mcp/build/conformance-deps/python-sdk/src/mcp/client/auth/`）；平台的 `docs/adr/idp-mcp-bridge-oauth-plan.md`（第 2、3、5、7 节）；对外互通 ADR 草案 D-X1、D-X2、D-X4；idp-mcp ADR-0001 D12、D44、D50 到 D53；idp-web ADR-0001 D1、D2、D6 到 D8、D14、D22、D24；idp-workspace ADR-0001 D16；MCP 2026-07-28 |
 
@@ -50,15 +50,17 @@
 | D30 | **列表：每条连接对调用成员的状态，不含令牌、不含授权服务器的地址** | `GET .../connections`：`id`、`title`、`status`（`not_required`、`not_connected`、`connected`、`reauthorization_required`）、`reason`（`insufficient_scope`、`issuer_changed`、`expired`）、`scope`（成员授予的）。测试里整个答案不含任何令牌、授权服务器的地址或端点路径 |
 | D31 | **日志、指标、错误、审计、API 答案里没有令牌、授权码、验证码、`state`、客户端密钥（授权地址除外）** | 授权地址带 `state` 与挑战是设计如此，只给 Workspace，不进日志（API 日志与审计不记答案）。OAuth 的日志只写（连接、租户、固定的码）；`oauth.Error` 的 `Detail` 是桥自己的话（可含元数据里的地址，从不含秘密），不进给成员的答案；API 的错误是固定的码。令牌端点与撤销端点的响应体从不读进日志或错误（只读 `error` 的固定集合）。测试 `noSecretsAnywhere`：把测试里捕获到的一切（日志、指标、每个 API 答案与 MCP 答案）对授权服务器替身签发过的每个令牌、刷新令牌、授权码、客户端密钥做子串搜索，在成功与每种失败（错的 iss、授权被拒、令牌端点 500、`invalid_grant`、撤销失败）之后；并有一个"日志里确实有内容"的检查，防止搜索空转 |
 | D32 | **设置、清单与命令** | 新设置见 RUNBOOK 第 5 节与 `main.go`：`IDP_BRIDGE_DATABASE_URL[_FILE]`、`IDP_BRIDGE_ENCRYPTION_KEYS_FILE`、`IDP_BRIDGE_REDIRECT_URI`、`IDP_BRIDGE_OIDC_ISSUER`、`IDP_BRIDGE_OIDC_JWKS_URL`、`IDP_BRIDGE_OIDC_ALLOW_HTTP`、`IDP_BRIDGE_OIDC_CA_FILE`、`IDP_BRIDGE_API_AUDIENCE`、`IDP_BRIDGE_WORKSPACE_CLIENT`、`IDP_BRIDGE_TENANT_CLAIM`；有 oauth 连接时必需，没有时一个不读。子命令 `migrate`、`ensure-login`、`revoke`、`reseal`（用同一个镜像，`FROM scratch`，所以一次性 Job 而不是 exec）。清单：迁移 Job `idp-mcp-bridge-migrate`（只挂 Secret `idp-mcp-bridge-database-owner`）；Deployment 多挂 Secret `idp-mcp-bridge-database`（只有应用角色的 URL）与 `idp-mcp-bridge-encryption-keys`（都 `optional`：没有 oauth 连接时不必有），出口策略多两条：`bridge-database`（Deployment 与 Job，`databases` 命名空间的 PostgreSQL，5432）与 `bridge-keycloak`（`keycloak` 命名空间的 Keycloak 的 JWKS，8443，按你的集群调整）；入口不变（8681 只放 Workspace）。`tests/deploy` 比对这些。`make test-integration` 起一个自己的 PostgreSQL 容器，让授权流程与存储也在 PostgreSQL 上跑一遍（内存与 PostgreSQL 两个存储跑同一组测试），用完删掉 |
+| D33 | **评审账号：连接的、不是成员的；运维授权，只用于 `tools/list`，从不用于 `tools/call`** | 计划第 2 节第 8 点：很多第三方连列出工具都要令牌，网关的注册、评审与漂移探测又没有成员。连接是整个部署共用的，所以评审账号是**运维的**：**每条 `oauth` 连接至多一个**。**谁可以授权**：令牌带配置的 realm 角色（`IDP_BRIDGE_REVIEWER_ROLE`，**没有缺省**，不设就没有人；平台的 realm 把 realm 角色放在 `roles` 声明里，`IDP_BRIDGE_ROLES_CLAIM` 可改）、设了 `IDP_BRIDGE_REVIEWER_TENANT` 时还要是这个租户。由 `idauth` 在验证令牌时判定，`auth.Subject.Reviewer`；网关的断言不会设它。**路由**（B2 的认证，同一个 Workspace 令牌）：`POST /internal/v1/connections/{id}/reviewer/authorization` → `{"url"}`（没有角色是 403 `forbidden`；不要令牌的连接 404）；回调仍是 `POST .../callback`：待办的 `state` 记着这是评审账号的授权和发起的运维（租户加成员，绑定同 B2），回调时**再查一次角色**（授权中途角色被收回则 403，`state` 已用掉）；`DELETE .../reviewer/grant` → 204（撤销同成员的断开：先刷新令牌、再访问令牌，不论成败都删除）；`GET .../connections` 只对有角色的调用者在每条连接上多一个 `"reviewer": {"status","reason","scope"}`（状态同成员的，不要令牌的连接是 `not_required`），别人的答案里没有这个键。**存储**：授权库的同一张表，一行，`reviewer = true`，租户与成员为空（库的 CHECK 约束保证"评审账号的行没有租户与成员，成员的行两者都有"），主键含 `reviewer`；`authorized_by` 记发起的运维（租户/成员）；**密封的附加数据含 `reviewer`**：评审账号的令牌解不出成员的，反之亦然。同一个人的成员授权与评审账号**互相独立**：各自刷新、断开、显示；成员离职（`RevokeMember`）不动评审账号，撤下连接（`RevokeConnection`）两种都删。迁移 `0002_reviewer_grants.sql`（`pending_states` 多一列 `reviewer`）。**使用**：`ReviewerSource.Token` 只被 `tools/list`（网关的列表、目录刷新）读，`CallTool` **从不**看这里（测试：评审账号存在时，没有授权的成员仍得到"需要授权"、第三方一次请求也没有收到；有授权的成员的调用带的是自己的令牌）。刷新走 B2 的同一个行锁与轮换（`renew` 对任何一种授权）；列表遇 401 时向来源要一次新令牌再试一次；刷新令牌被拒（`invalid_grant`）则删除评审授权，列表退回不带令牌（第三方答 401 时的错误写明"这条连接没有授权好的评审账号"）。评审账号的授权范围：连接文件的 `authorization.reviewerScopes`（可选，缺省用 `scopes`），**应当是能列出工具的最小范围**。**评审账号应当是什么**：第三方那里**专门为此建立的账号**（不是任何人的个人账号，不属于会离职的成员），只有列出工具所需的最小权限（只读，不能访问成员的数据；有的服务有"仅元数据"的范围），名下没有数据；用它走一遍授权就是上面的流程。它的令牌能做的事就是列出工具，桥也只拿它做这件事，但令牌本身在第三方那里仍是一个账号的令牌，所以按最小权限建立是第一道防线，桥的限制（只用于 `tools/list`）是第二道。运维步骤见 RUNBOOK 5.6 |
+| D34 | **`Mcp-Param-*` 头：由桥按工具定义与调用的参数计算，从不复制网关请求里的** | 2026-07-28（SEP-2243）：工具可在输入 schema 的属性上写 `x-mcp-header`，客户端把这些参数镜像进 `Mcp-Param-<名>` 头，声明了的服务器可以因为缺这些头而拒绝调用。idp-mcp 的网关不知道哪些头是工具声明的，只转发并限制数量与长度（idp-mcp D51 g，D12）；桥是对第三方的客户端，**知道**工具的定义，所以计算。**规则**（按规范、官方 SDK 的 `mcp/shared/inbound.py` 与 idp-mcp 的 `internal/server/protocol.go`）：注解只在**经由 `properties` 一路可达的属性**上有效（根上、`anyOf`、`items`、`patternProperties`、`$defs` 里都无效，`default`/`enum` 等实例数据不是 schema）；名字是 RFC 9110 的 token（所以不可能含冒号、空格、换行）；属性类型是 `string`、`integer` 或 `boolean`（**不是 `number`**：它的文本形式各实现不一致）；名字不区分大小写地唯一。**有任何一个注解无效的工具没有任何头**（2026-07-28 的客户端必须丢弃这样的工具）。**值**：缺失或 `null` 没有头；布尔是 `true`/`false`；整数按原样写（不经浮点，大整数不会被舍入；带小数、指数、前导零的不渲染）；字符串原样；对象与数组没有渲染；**不是可打印 ASCII、或有首尾空白、或本身像 `=?base64?...?=` 的值用 Base64 形式**（idp-mcp 的 `EncodeHeaderValue`）：所以含回车换行的值不可能结束一行头去注入另一行（测试：`eu\r\nX-Evil: 1\r\nAuthorization: ...` 到第三方是 Base64，第三方没有收到 `X-Evil`，也没有收到被换掉的 `Authorization`）。**大小**：至多 16 个头、名字（前缀之后）至多 128 字节、值（编码之后）至多 1024 字节，同 idp-mcp 转发时的上限；超出则**拒绝这次调用**（工具错误，写明哪里太长，没有请求发出，不算第三方的失败），不截断、不少发几个头（idp-mcp 同样：少几个头会让第三方因看不见的原因拒绝）。**定义从哪里来**：桥最后一次列出的目录，每条连接一份：每次 `tools/list`（网关的，或桥自己为此做的）更新；一个调用遇到**未知的工具**（目录里没有，或目录比 5 分钟 TTL 旧）时先刷新一次（用评审账号的令牌，D33），**且**连接的熔断器是关的、没有超过连接的限流、距上一次由调用引起的刷新不到 30 秒则不刷新——所以一个编造工具名的模型不能让桥去列表；刷新失败或仍然未知：**这个调用不带 `Mcp-Param-*` 头照样发出**。**从不复制**：给第三方的头仍是 D9 的白名单，`Mcp-Param-*` 只能经 `CallToolWithHeaders` 的额外头进去，且只放行这一族、每个名字一个值（测试：网关请求上的 `Mcp-Param-Region` 与别的头不被复制）。这修订 D9 与第 3 节第 3 条：`Mcp-Param-*` 不再整体不转发 |
 
 ## 3. 对计划与相邻决策的反馈（B1、B2 中发现的）
 
 1. **计划第 5 节 B1 与第 3 节的"issuer 现在就必填"与"不需要令牌的连接已可用"互相冲突**，D4 用 `authorization.mode` 解决：issuer 对 `oauth` 必填、对 `none` 不允许。
 2. **G1 要改的不止 D51 a**：（a）D50 要求 external 目标的 `identity` 是 `none`，登记时拒绝 `forward`，指向桥的要允许 `forward`；（b）`externalParams` 从白名单重建 `_meta`，只有三个键，G1 必须把断言（`io.idp.telos/caller-assertion`）作为第四个键放进去，而且只对桥的目标；（c）**断言的 `req` 摘要是对"params 去掉 `_meta`"算的**：网关在 `externalParams` 之后又把 `task`、`inputResponses`、`requestState` 去掉，摘要必须算在**发给桥的那一份**上，不是客户端发来的那一份，否则合法的调用也因摘要不符被桥拒绝；（d）受众是桥的端点（带路径）。在 G1 之前，桥的每个 `tools/call` 都是 403。
-3. **`Mcp-Param-*`**：网关对 external 目标转发它们（D51 g），桥不转发（D9）；依赖这些头的第三方工具会失败，需要时按工具的 schema 构造。
+3. **`Mcp-Param-*`**：网关对 external 目标转发客户端给的那些（D51 g），桥不复制它们；B1 完全不发，依赖这些头的第三方工具会失败。**B3（D34）按工具的 schema 与参数计算。**
 4. **进度**：网关把进度通知从 external 上游转给客户端（D51 c），桥的端点只回答 JSON，没有进度；进度令牌仍转给第三方。要有进度，桥要改成可以流式回答。
 5. **OAuth 重定向地址**要在桥的配置里（B2 的设置），不是请求字段（D16）。
-6. **评审账号**（计划第 2 节第 8 点）的探测也要过限流与熔断（D12、D13），B3 注意。
+6. **评审账号**（计划第 2 节第 8 点）的探测也要过限流与熔断（D12、D13）：B3 的目录刷新同样（D34）。
 
 **B2：官方 SDK 的客户端与本实现不同的地方**（规范页本机仍取不到，下面是 SDK 的实现与 RFC 的规则对照；与规范原文的核对仍未做）：
 
@@ -78,7 +80,7 @@
 17. 计划第 2 节第 5 点写"回调里换令牌"，第 7 节选 Workspace 接回调：于是桥的"回调"是 Workspace 调用的 API，`state` 的所属人检查在桥里做（调用的租户与成员必须是开始授权的），Workspace 另核对登录成员；两层都要有，任何一层缺了都不够。
 18. 计划没有说**授权的撤销**在第三方不支持 RFC 7009 时怎么办：只删除。没有"提示成员去第三方那里手动撤销"的机制。
 19. 计划没有说**成员离开租户时谁触发清理**（第 2 节第 6 点写了"成员离开租户时删掉令牌"）：没有来源。D29 记为开放；需要身份提供方的事件或 HOST/Workspace 的钩子。
-20. **评审账号的授权**（B3）用什么流程取得令牌：同一个授权码流程但主体是"评审账号"，还是服务级凭据？计划第 2 节第 8 点只说"运维授权"，B3 要决定；`ReviewerSource` 的接口不变。
+20. **评审账号的授权**用什么流程取得令牌：B3 取了同一个授权码流程，由有 realm 角色的运维在第三方那里以专门的账号登录（D33）；服务级凭据（客户端凭据模式）仍是计划第 6 节的以后的选项。
 21. 第三方元数据里的 `scopes_supported` 与连接文件的 `scopes`：连接文件为准，空时才用资源元数据的（SDK 的次序里 `WWW-Authenticate` 的 `scope` 更前，本实现只在 403 `insufficient_scope` 时用质询的 `scope`，401 质询里的 `scope` 不用：它来自第三方，不应改变运维配置的范围）。
 22. **动态注册的客户端是公共客户端**（`token_endpoint_auth_method: none` 请求）；服务器若指派了带密钥的方式，按它指派的用（D22）。
 
@@ -234,3 +236,48 @@
 | B2R-12 | `migrate` 不要求所有者的 URL | `TestTheDatabaseCommandsNeedTheOwnersURLAndNothingElse` |
 
 12 项全部失败。第 5 节的 57 项与第 4 节的 57 项在这次改动之后又整体重跑过，仍然全部失败。
+
+## 7. 反向验证（B3：D33、D34）
+
+做法同第 5 节，在 PostgreSQL 上做。
+
+| # | 去掉的控制（改动） | 失败的测试 |
+|---|---|---|
+| B3R-1 | 没有评审角色也能开始评审账号的授权 | `TestOnlyACallerWithTheReviewerRoleMayAuthorizeOrDisconnectAReviewerAccount` |
+| B3R-2 | 没有评审角色也能断开评审账号 | `TestOnlyACallerWithTheReviewerRoleMayAuthorizeOrDisconnectAReviewerAccount` |
+| B3R-3 | 回调时不再查评审角色 | `TestOnlyACallerWithTheReviewerRoleMayAuthorizeOrDisconnectAReviewerAccount` |
+| B3R-4 | 评审授权存成发起运维自己的成员授权 | `TestAnOperatorAuthorizesTheConnectionsReviewerAccountAndTheListingUsesItsToken`, `TestDisconnectingTheReviewerAccountRevokesItsTokensAtTheServer`, `TestTheListShowsTheReviewerAccountToACallerWithTheRoleOnly` 等 |
+| B3R-5 | 评审账号的密文也能按成员的打开（附加数据不含 `reviewer`） | `TestAReviewerSealedValueDoesNotOpenAsAMembersAndNeitherTheOtherWayRound`, `TestAnOperatorAuthorizesTheConnectionsReviewerAccountAndTheListingUsesItsToken` |
+| B3R-6 | 评审授权用连接的 `scopes`，不用 `reviewerScopes` | `TestAnOperatorAuthorizesTheConnectionsReviewerAccountAndTheListingUsesItsToken`, `TestTheListShowsTheReviewerAccountToACallerWithTheRoleOnly` |
+| B3R-7 | 目录列表不用评审账号的令牌 | `TestAnOperatorAuthorizesTheConnectionsReviewerAccountAndTheListingUsesItsToken`, `TestTheReviewerTokenIsRenewedLikeAMembersUnderTheSameLockAndRotation` |
+| B3R-8 | 成员没有授权时，调用退而用评审账号的令牌 | `TestTheReviewerTokenIsNeverUsedForACallAndTheMembersGrantIsIndependentOfIt` |
+| B3R-9 | 所有人的列表里都有 `reviewer` | `TestTheListShowsTheReviewerAccountToACallerWithTheRoleOnly` |
+| B3R-10 | 成员离职连评审授权一起删（存储） | `TestAReviewerGrantIsOfTheConnectionAndNeverOfAMember` |
+| B3R-11 | 库不拒绝既是评审又有租户成员、或两者都没有的行 | `TestTheDatabaseRefusesARowThatIsNeitherAMembersNorTheConnectionsReviewer` |
+| B3R-12 | 任何角色都算评审 | `TestTheReviewerRoleAndTenantMakeAReviewerAndNothingElseDoes` |
+| B3R-13 | 评审租户不起限定作用 | `TestTheReviewerRoleAndTenantMakeAReviewerAndNothingElseDoes` |
+| B3R-14 | 只设评审租户不设角色不是错误 | `TestTheReviewerRoleHasNoDefaultAndATenantNeedsARole` |
+| B3R-15 | 列表遇 401 不向来源要新令牌 | `TestTheReviewerTokenIsRenewedLikeAMembersUnderTheSameLockAndRotation` |
+| B3R-16 | 网关的列表不更新工具目录 | `TestTheCatalogIsRefreshedOnAMissAndAfterTheTTLAndNotMoreOftenThanTheMinimum`, `TestTheCircuitBreakerOpensAfterConsecutiveFailuresAndClosesAfterATrial` |
+| B3R-17 | `number` 类型的属性也能有 `x-mcp-header` | `TestAToolWhoseDefinitionIsUnknownOrInvalidGetsNoHeadersAndTheCallStillGoes`, `TestAToolWithAnInvalidAnnotationHasNoHeaders` |
+| B3R-18 | 头的名字不必是 token | `TestAToolWithAnInvalidAnnotationHasNoHeaders` |
+| B3R-19 | 头的名字可以大小写不同地重复 | `TestAToolWithAnInvalidAnnotationHasNoHeaders` |
+| B3R-20 | 注解可以在不经 `properties` 可达的位置 | `TestAToolWithAnInvalidAnnotationHasNoHeaders` |
+| B3R-21 | 不是可打印 ASCII 的值（含回车换行）原样发送 | `TestAValueThatWouldInjectAHeaderLineIsSentInTheBase64Form`, `TestAValueThatWouldInjectAHeaderLineReachesTheThirdPartyAsBase64AndAsNothingElse`, `TestHeadersThatDoNotFitTheBoundsRefuseTheCallAndNothingIsTruncated` |
+| B3R-22 | 像 `=?base64?...?=` 的值原样发送 | `TestAValueThatWouldInjectAHeaderLineIsSentInTheBase64Form` |
+| B3R-23 | 超过 1024 字节的值照发 | `TestAnArgumentThatIsTooLongForItsHeaderRefusesTheCallAndNothingIsSent`, `TestHeadersThatDoNotFitTheBoundsRefuseTheCallAndNothingIsTruncated` |
+| B3R-24 | 超过 16 个头照发 | `TestHeadersThatDoNotFitTheBoundsRefuseTheCallAndNothingIsTruncated` |
+| B3R-25 | 超过 128 字节的名字照发 | `TestHeadersThatDoNotFitTheBoundsRefuseTheCallAndNothingIsTruncated` |
+| B3R-26 | 额外头里任何头都发出去 | `TestOnlyMcpParamHeadersGoOutThroughTheExtraHeaders` |
+| B3R-27 | 带小数的整数也渲染成头 | `TestTheHeadersAreComputedFromTheArgumentsAsTheSpecificationSays` |
+| B3R-28 | 太长的参数不拒绝调用 | `TestAnArgumentThatIsTooLongForItsHeaderRefusesTheCallAndNothingIsSent` |
+| B3R-29 | 目录永不过期 | `TestTheCatalogIsRefreshedOnAMissAndAfterTheTTLAndNotMoreOftenThanTheMinimum` |
+| B3R-30 | 每个未知工具的调用都去刷新目录 | `TestTheCatalogIsRefreshedOnAMissAndAfterTheTTLAndNotMoreOftenThanTheMinimum` |
+| B3R-31 | 熔断器不是关的也为调用刷新目录 | `TestTheRefreshOfTheCatalogUsesTheConnectionsLimitsAndTheBreaker` |
+| B3R-32 | 为调用刷新目录不受连接限流约束 | `TestTheRefreshOfTheCatalogUsesTheConnectionsLimitsAndTheBreaker` |
+| B3R-33 | 不校验 `reviewerScopes` | `TestReviewerScopesAreOptionalCheckedLikeScopesAndForbiddenWithoutOAuth` |
+| B3R-34 | 不要令牌的连接可以写 `reviewerScopes` | `TestReviewerScopesAreOptionalCheckedLikeScopesAndForbiddenWithoutOAuth` |
+| B3R-35 | 评审授权的状态不记它是评审的 | `TestAnOperatorAuthorizesTheConnectionsReviewerAccountAndTheListingUsesItsToken`, `TestDisconnectingTheReviewerAccountRevokesItsTokensAtTheServer`, `TestOnlyACallerWithTheReviewerRoleMayAuthorizeOrDisconnectAReviewerAccount` 等 |
+| B3R-36 | 迁移 2 没有被要求（版本检查少一） | `TestAReviewerGrantIsOfTheConnectionAndNeverOfAMember`, `TestEveryStoreKeepsGrantsPerTenantMemberAndConnection`, `TestLockedSerializesCallersAcrossReplicasAndAnErrorLeavesTheRowAsItWas` 等 |
+
+36 项全部失败。B3 完成之后 B1、B2 与 D25 的反向验证表又整体重跑过，仍然全部失败（有几个测试因为为调用刷新目录而多了一次 `tools/list` 请求，调整了期望的请求数：熔断器与地址规则的测试先让网关列一次，目录就不需要刷新）。

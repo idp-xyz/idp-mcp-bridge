@@ -89,6 +89,11 @@ func owner(who auth.Subject, c string) grants.Key {
 	return grants.Key{Tenant: who.Tenant, Member: who.Member, Connection: c}
 }
 
+// reviewerKey is the key of a connection's reviewer grant (ADR-0001 D33): the connection's, not any member's.
+func reviewerKey(c string) grants.Key { return grants.Key{Connection: c, Reviewer: true} }
+
+func forbidden() error { return apiErr(http.StatusForbidden, "forbidden") }
+
 // union is the scopes of a followed by those of b that a does not have, in order (SEP-2350: a step-up asks for what was
 // granted and what is now needed).
 func union(a, b string) string {
@@ -205,6 +210,19 @@ func discoveryErr(err error) error {
 // Start makes the address the member's browser is sent to (ADR-0001 D23): PKCE S256, a state of 32 random bytes kept
 // server-side with who started it, the resource of RFC 8707. The member is the one the authenticated token names.
 func (s *Service) Start(ctx context.Context, who auth.Subject, id string) (api.Authorization, error) {
+	return s.start(ctx, who, id, false)
+}
+
+// StartReviewer starts the authorization of the connection's reviewer account (ADR-0001 D33): the same flow, for an operator whose
+// token carries the reviewer role, and the grant it ends in is the connection's, not the operator's own.
+func (s *Service) StartReviewer(ctx context.Context, who auth.Subject, id string) (api.Authorization, error) {
+	if !who.Reviewer {
+		return api.Authorization{}, forbidden()
+	}
+	return s.start(ctx, who, id, true)
+}
+
+func (s *Service) start(ctx context.Context, who auth.Subject, id string, reviewer bool) (api.Authorization, error) {
 	c, ok := s.conn(id)
 	if !ok {
 		return api.Authorization{}, apiErr(http.StatusNotFound, "not_found")
@@ -220,11 +238,14 @@ func (s *Service) Start(ctx context.Context, who auth.Subject, id string) (api.A
 		return api.Authorization{}, discoveryErr(err)
 	}
 	scope := strings.Join(c.Authorization.Scopes, " ")
+	if reviewer && len(c.Authorization.ReviewerScopes) > 0 {
+		scope = strings.Join(c.Authorization.ReviewerScopes, " ") // the least that lets the account list the tools
+	}
 	if scope == "" {
 		scope = strings.Join(d.PRMScopes, " ") // the resource's own list, when the connection names none (the SDK's order)
 	}
 	// after a step-up the member authorizes again for what was granted and what the third party now asks for
-	if g, err := s.Store.Get(ctx, owner(who, id)); err == nil && g.NeededScope != "" {
+	if g, err := s.Store.Get(ctx, owner(who, id)); !reviewer && err == nil && g.NeededScope != "" {
 		scope = union(scope, g.NeededScope)
 	}
 	prompt := false
@@ -242,12 +263,14 @@ func (s *Service) Start(ctx context.Context, who auth.Subject, id string) (api.A
 	if err != nil {
 		return api.Authorization{}, err
 	}
-	sealed, err := s.Sealer.Seal([]byte(verifier), owner(who, id))
+	stateKey := owner(who, id)
+	stateKey.Reviewer = reviewer // the verifier is sealed for this kind of authorization and no other
+	sealed, err := s.Sealer.Seal([]byte(verifier), stateKey)
 	if err != nil {
 		return api.Authorization{}, err
 	}
 	resource := c.Parsed.URL()
-	err = s.Store.PutState(ctx, grants.State{Hash: hash(state), Key: owner(who, id), SealedVerifier: sealed, Issuer: c.Authorization.Issuer,
+	err = s.Store.PutState(ctx, grants.State{Hash: hash(state), Key: stateKey, SealedVerifier: sealed, Issuer: c.Authorization.Issuer,
 		RedirectURI: s.RedirectURI, Scope: scope, ClientID: ca.ID, Resource: resource, Expires: s.now().Add(StateTTL)})
 	if err != nil {
 		return api.Authorization{}, err
@@ -297,6 +320,9 @@ func (s *Service) Finish(ctx context.Context, who auth.Subject, id string, f api
 	if err != nil {
 		return err
 	}
+	if st.Reviewer && !who.Reviewer {
+		return forbidden() // the role was taken away since the authorization started
+	}
 	switch {
 	case st.Connection != id:
 		return apiErr(http.StatusBadRequest, "invalid_state") // the page's connection is not the one that was started
@@ -328,7 +354,7 @@ func (s *Service) Finish(ctx context.Context, who auth.Subject, id string, f api
 	if f.Code == "" {
 		return apiErr(http.StatusBadRequest, "invalid_request")
 	}
-	verifier, err := s.Sealer.Open(st.SealedVerifier, owner(who, id))
+	verifier, err := s.Sealer.Open(st.SealedVerifier, st.Key)
 	if err != nil {
 		return err
 	}
@@ -363,7 +389,11 @@ func (s *Service) Finish(ctx context.Context, who auth.Subject, id string, f api
 	if granted == "" {
 		granted = st.Scope // RFC 6749 section 5.1: omitted, it is what was requested
 	}
-	g, err := s.seal(grants.Grant{Key: owner(who, id), Issuer: c.Authorization.Issuer, Scope: granted, CreatedAt: s.now(), RefreshedAt: s.now()}, tok)
+	key, by := owner(who, id), ""
+	if st.Reviewer {
+		key, by = reviewerKey(id), who.Tenant+"/"+who.Member // the connection's reviewer grant; never the operator's own
+	}
+	g, err := s.seal(grants.Grant{Key: key, Issuer: c.Authorization.Issuer, Scope: granted, CreatedAt: s.now(), RefreshedAt: s.now(), AuthorizedBy: by}, tok)
 	if err != nil {
 		return err
 	}
@@ -399,7 +429,12 @@ func (s *Service) Token(ctx context.Context, who auth.Subject, id string) (strin
 	if !ok {
 		return "", auth.ErrNoToken
 	}
-	g, err := s.Store.Get(ctx, owner(who, id))
+	return s.token(ctx, owner(who, id), who, c)
+}
+
+// token is Token for a grant of any kind: a member's, or a connection's reviewer grant.
+func (s *Service) token(ctx context.Context, key grants.Key, who auth.Subject, c config.Connection) (string, error) {
+	g, err := s.Store.Get(ctx, key)
 	if errors.Is(err, grants.ErrNotFound) {
 		return "", auth.ErrNoToken
 	}
@@ -413,8 +448,34 @@ func (s *Service) Token(ctx context.Context, who auth.Subject, id string) (strin
 		t, err := s.Sealer.Open(g.SealedAccess, g.Key)
 		return string(t), err
 	}
-	return s.renew(ctx, who, c, "")
+	return s.renew(ctx, key, who, c, "")
 }
+
+// ReviewerSource is the connections' reviewer accounts as the auth.ReviewerSource of the bridge: the token for tools/list
+// (registration, review, drift probes) and for nothing else (ADR-0001 D33).
+type ReviewerSource struct{ S *Service }
+
+// Token is the reviewer account's token, renewed like a member's (the same row lock, the same rotation), "" for a connection
+// that needs none, auth.ErrNoToken if the connection has no usable reviewer grant.
+func (r ReviewerSource) Token(ctx context.Context, connection string) (string, error) {
+	c, ok := r.S.conn(connection)
+	if !ok {
+		return "", nil
+	}
+	return r.S.token(ctx, reviewerKey(connection), auth.Subject{}, c)
+}
+
+// Refresh is asked after the third party refused rejected, the reviewer's token.
+func (r ReviewerSource) Refresh(ctx context.Context, connection, rejected string) (string, error) {
+	c, ok := r.S.conn(connection)
+	if !ok {
+		return "", auth.ErrNoToken
+	}
+	return r.S.renew(ctx, reviewerKey(connection), auth.Subject{}, c, rejected)
+}
+
+var _ auth.ReviewerSource = ReviewerSource{}
+var _ auth.ReviewerRefresher = ReviewerSource{}
 
 // Refresh is asked after the third party answered 401 to rejected: a new access token, from the refresh token, or ErrNoToken.
 func (s *Service) Refresh(ctx context.Context, who auth.Subject, id, rejected string) (string, error) {
@@ -422,19 +483,19 @@ func (s *Service) Refresh(ctx context.Context, who auth.Subject, id, rejected st
 	if !ok {
 		return "", auth.ErrNoToken
 	}
-	return s.renew(ctx, who, c, rejected)
+	return s.renew(ctx, owner(who, id), who, c, rejected)
 }
 
 // renew is the one place a refresh token is spent. It runs with the grant's row locked, on whichever replica, and decides
 // after it has the lock, on what is in the row then: a second caller that waited finds the first one's result and uses it, so
 // a refresh token that the server invalidates when it rotates it is spent once. rejected is the access token the third
 // party refused ("" for a renewal ahead of expiry).
-func (s *Service) renew(ctx context.Context, who auth.Subject, c config.Connection, rejected string) (string, error) {
+func (s *Service) renew(ctx context.Context, key grants.Key, who auth.Subject, c config.Connection, rejected string) (string, error) {
 	var token string
 	var gone bool
 	ctx, cancel := context.WithTimeout(ctx, RefreshTimeout+s.timeoutSlack())
 	defer cancel()
-	err := s.Store.Locked(ctx, owner(who, c.ID), func(g grants.Grant) (grants.Grant, grants.Action, error) {
+	err := s.Store.Locked(ctx, key, func(g grants.Grant) (grants.Grant, grants.Action, error) {
 		if g.Issuer != c.Authorization.Issuer || g.ReauthReason != "" {
 			gone = true // not deleted: the member authorizes again
 			return g, grants.Keep, nil
@@ -555,6 +616,27 @@ func (s *Service) Disconnect(ctx context.Context, who auth.Subject, id string) e
 	return s.Store.Delete(ctx, g.Key)
 }
 
+// DisconnectReviewer removes the connection's reviewer account the way a member disconnects: revoked at the server if it can be,
+// deleted either way.
+func (s *Service) DisconnectReviewer(ctx context.Context, who auth.Subject, id string) error {
+	if !who.Reviewer {
+		return forbidden()
+	}
+	c, ok := s.conn(id)
+	if !ok {
+		return apiErr(http.StatusNotFound, "not_found")
+	}
+	g, err := s.Store.Get(ctx, reviewerKey(id))
+	if errors.Is(err, grants.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	s.revoke(ctx, who, c, g)
+	return s.Store.Delete(ctx, g.Key)
+}
+
 // Revoke is Disconnect for the operator, for one grant: used by `idp-mcp-bridge revoke`.
 func (s *Service) Revoke(ctx context.Context, g grants.Grant) {
 	if c, ok := s.conn(g.Connection); ok {
@@ -611,23 +693,38 @@ func (s *Service) List(ctx context.Context, who auth.Subject) ([]api.ConnectionS
 	for _, c := range s.Connections {
 		st := api.ConnectionStatus{ID: c.ID, Title: c.Title}
 		g, has := by[c.ID]
-		switch {
-		case c.Authorization.Mode == config.AuthNone:
-			st.Status = api.StatusNotRequired
-		case !has:
-			st.Status = api.StatusNotConnected
-		case g.Issuer != c.Authorization.Issuer:
-			st.Status, st.Reason = api.StatusReauthorize, "issuer_changed"
-		case g.ReauthReason != "":
-			st.Status, st.Reason, st.Scope = api.StatusReauthorize, g.ReauthReason, g.Scope
-		case len(g.SealedRefresh) == 0 && !g.AccessExpires.IsZero() && !g.AccessExpires.After(s.now()):
-			st.Status, st.Reason, st.Scope = api.StatusReauthorize, "expired", g.Scope
-		default:
-			st.Status, st.Scope = api.StatusConnected, g.Scope
+		st.Status, st.Reason, st.Scope = s.statusOf(c, g, has)
+		if who.Reviewer { // only a caller with the reviewer role sees it
+			rs := api.ReviewerStatus{Status: api.StatusNotRequired}
+			if c.Authorization.Mode == config.AuthOAuth {
+				rg, rerr := s.Store.Get(ctx, reviewerKey(c.ID))
+				if rerr != nil && !errors.Is(rerr, grants.ErrNotFound) {
+					return nil, rerr
+				}
+				rs.Status, rs.Reason, rs.Scope = s.statusOf(c, rg, rerr == nil)
+			}
+			st.Reviewer = &rs
 		}
 		out = append(out, st)
 	}
 	return out, nil
+}
+
+// statusOf is the status of a grant (a member's or a reviewer's) of a connection, with the reason code and the granted scope.
+func (s *Service) statusOf(c config.Connection, g grants.Grant, has bool) (status, reason, scope string) {
+	switch {
+	case c.Authorization.Mode == config.AuthNone:
+		return api.StatusNotRequired, "", ""
+	case !has:
+		return api.StatusNotConnected, "", ""
+	case g.Issuer != c.Authorization.Issuer:
+		return api.StatusReauthorize, "issuer_changed", ""
+	case g.ReauthReason != "":
+		return api.StatusReauthorize, g.ReauthReason, g.Scope
+	case len(g.SealedRefresh) == 0 && !g.AccessExpires.IsZero() && !g.AccessExpires.After(s.now()):
+		return api.StatusReauthorize, "expired", g.Scope
+	}
+	return api.StatusConnected, "", g.Scope
 }
 
 // Sweep removes the authorizations that expired (a member who never came back from the third party's page).

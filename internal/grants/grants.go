@@ -23,6 +23,10 @@ var ErrNotFound = errors.New("not found")
 // grant is never found by anything else.
 type Key struct {
 	Tenant, Member, Connection string
+	// Reviewer marks the connection's reviewer grant (ADR-0001 D33): then Tenant and Member are empty, there is one per connection,
+	// and it is never a member's own grant, not even of the operator who authorized it: it is part of the key and of what the seal
+	// binds.
+	Reviewer bool
 }
 
 // Grant is a member's authorization of one connection, as stored.
@@ -45,6 +49,8 @@ type Grant struct {
 	ReauthReason string
 	CreatedAt    time.Time
 	RefreshedAt  time.Time
+	// AuthorizedBy is, for a reviewer grant, the tenant/member of the operator who authorized it.
+	AuthorizedBy string
 }
 
 // State is an authorization that is under way: what the callback needs to finish it and to check who finishes it. Keyed by

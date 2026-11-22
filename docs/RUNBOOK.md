@@ -38,7 +38,7 @@ kubectl -n idp-mcp-bridge rollout status deploy/idp-mcp-bridge
 IDP_BRIDGE_ENDPOINTS=http://idp-mcp-bridge.idp-mcp-bridge.svc.cluster.local:8680/mcp/
 # 登记（以 operator 的令牌）；class 之后不能改
 POST /api/v1/servers  {"displayName":"github","targetName":"github","endpoint":"http://idp-mcp-bridge.idp-mcp-bridge.svc.cluster.local:8680/mcp/github","class":"external","identity":"forward"}
-POST /api/v1/servers/{id}/discover        # 经桥列出第三方的工具（不带令牌，所以只对不需要令牌的连接成功；评审账号是 B3）
+POST /api/v1/servers/{id}/discover        # 经桥列出第三方的工具：不需要令牌的连接直接成功；要令牌的连接要先有评审账号（第 5.6 节），否则 502
 GET  /api/v1/servers/{id}/catalog         # 评审人读完整目录
 POST /api/v1/servers/{id}/approve         {"digest":"<看过的目录摘要>"}
 ```
@@ -69,7 +69,9 @@ POST /api/v1/servers/{id}/approve         {"digest":"<看过的目录摘要>"}
 | `IDP_BRIDGE_REDIRECT_URI` | **Workspace 的回调页**，所有连接共用，公网 https、无片段。它是配置，不是请求的字段：能指定它的调用者能把授权码送到自己的地址。授权服务器上登记（预注册客户端）或客户端元数据文档里写的 `redirect_uris` 就是它 |
 | `IDP_BRIDGE_OIDC_ISSUER`、`IDP_BRIDGE_API_AUDIENCE`、`IDP_BRIDGE_WORKSPACE_CLIENT` | 验证 Workspace 对内部 API 的调用（ADR D28）：Keycloak 的 realm、令牌的受众（Workspace 换令牌时的 `audience`）、唯一被接受的 `azp`（Workspace 的令牌交换客户端）。`IDP_BRIDGE_OIDC_JWKS_URL`（缺省 `<issuer>/protocol/openid-connect/certs`）必须是 https；集群内只有 http 时要显式设 `IDP_BRIDGE_OIDC_ALLOW_HTTP=true`（启动日志警告：决定谁能调用的密钥经 http 取）。`IDP_BRIDGE_OIDC_CA_FILE` 给它加一个 CA。`IDP_BRIDGE_TENANT_CLAIM`（缺省 `tenant_id`）是租户声明 |
 
-**Keycloak 要做的**：一个客户端代表桥（它的 client id 就是 `IDP_BRIDGE_API_AUDIENCE`），允许 Workspace 的令牌交换客户端把成员的令牌换成以它为受众的令牌（idp-workspace 的 `auth: exchange` 配置里 `audience` 填它）；令牌要带租户声明。桥的出口策略要放到 Keycloak 的 JWKS（`networkpolicy.yaml` 的 `bridge-keycloak`，按你的 Keycloak 调整命名空间、标签与端口）。
+| `IDP_BRIDGE_REVIEWER_ROLE`、`IDP_BRIDGE_REVIEWER_TENANT`、`IDP_BRIDGE_ROLES_CLAIM` | 谁可以授权评审账号（第 5.6 节）：令牌里 `roles` 声明（可改）含这个 realm 角色，设了租户则还要是这个租户。**没有缺省，不设就没有人能**；只设租户不设角色是配置错误 |
+
+**Keycloak 要做的**：一个客户端代表桥（它的 client id 就是 `IDP_BRIDGE_API_AUDIENCE`），允许 Workspace 的令牌交换客户端把成员的令牌换成以它为受众的令牌（idp-workspace 的 `auth: exchange` 配置里 `audience` 填它）；令牌要带租户声明；**要用评审账号的话，换来的令牌还要带 `roles` 声明**（桥的客户端要有 realm 角色的映射，平台的 realm 在用户的映射里有 `roles`，换出的令牌是否带上要在你的 Keycloak 里确认）。桥的出口策略要放到 Keycloak 的 JWKS（`networkpolicy.yaml` 的 `bridge-keycloak`，按你的 Keycloak 调整命名空间、标签与端口）。
 
 **Workspace 要做的**（W1）：托管每条 `cimd` 连接的客户端元数据文档，内容取自桥：`GET /internal/v1/connections/{id}/client-metadata`（不需要令牌，没有秘密），原样公开在连接文件里 `client.document` 的地址上，**逐字相同**（它就是 client_id）；回调页用成员的会话核对登录成员，再把 `code`、`state`、`iss`（或 `error`）连同成员的换来的令牌交给 `POST /internal/v1/connections/{id}/callback`。
 
@@ -79,10 +81,12 @@ POST /api/v1/servers/{id}/approve         {"digest":"<看过的目录摘要>"}
 
 | 路由 | 请求 | 答案 |
 |---|---|---|
-| `GET /internal/v1/connections` | 无 | `{"connections":[{"id","title","status","reason","scope"}]}`；`status` 是 `not_required`、`not_connected`、`connected`、`reauthorization_required`；`reason`（只有重新授权时）是 `insufficient_scope`、`issuer_changed`、`expired`；`scope` 是成员授予的。没有令牌、没有授权服务器的地址 |
+| `GET /internal/v1/connections` | 无 | `{"connections":[{"id","title","status","reason","scope","reviewer"}]}`；`reviewer`（`{"status","reason","scope"}`，状态同成员的）**只有带评审角色的调用者才有**，别人的答案里没有这个键；`status` 是 `not_required`、`not_connected`、`connected`、`reauthorization_required`；`reason`（只有重新授权时）是 `insufficient_scope`、`issuer_changed`、`expired`；`scope` 是成员授予的。没有令牌、没有授权服务器的地址 |
 | `POST /internal/v1/connections/{id}/authorization` | 无正文（有也不看） | `{"url": "<授权地址>"}`：授权服务器的 `authorization_endpoint` 加上 `response_type=code`、`client_id`、`redirect_uri`、`state`、`code_challenge`（S256）、`scope`、`resource`（RFC 8707）；404 `not_found`（没有这条连接、或它不要令牌）；409 `authorization_server_refused` 加 `reason`（`issuer_mismatch`、`issuer_not_listed`、`resource_mismatch`、`resource_metadata_origin`、`pkce_unsupported`、`client_identity_unsupported`、`address_refused`、`redirect_refused`、`metadata_invalid`）：对方的元数据与配置对不上，不重试也无用；502 `authorization_server_unavailable`：对方没有应答 |
 | `POST /internal/v1/connections/{id}/callback` | `{"code","state","iss","error"}` | 200 `{"connection","status":"connected"}`；400 `invalid_state`（没有、用过、不是这个成员的、不是这条连接的）、`state_expired`（10 分钟）、`invalid_request`、`authorization_failed` 加 `reason`（`iss_mismatch`、`iss_missing`、`invalid_grant`、`token_response_invalid`、`token_endpoint_error`）、`authorization_denied` 加 `reason`（`access_denied`、`invalid_scope`、`server_error`、`temporarily_unavailable`、`invalid_request`、`unauthorized_client`、`unsupported_response_type`，其他一律 `authorization_failed`）；409 `configuration_changed`；502 `authorization_server_unavailable` |
 | `DELETE /internal/v1/connections/{id}/grant` | 无 | 204（没有授权也是 204）；对方有撤销端点时先撤销刷新令牌再撤销访问令牌，不论撤销成不成功都删除 |
+| `POST /internal/v1/connections/{id}/reviewer/authorization` | 无 | 同上，是评审账号的授权地址；没有评审角色 403 `forbidden`；不要令牌的连接 404。授权在回调里完成（同一个回调路由），结果存为这条连接的评审授权，不是调用者自己的 |
+| `DELETE /internal/v1/connections/{id}/reviewer/grant` | 无 | 204；没有评审角色 403 `forbidden`；撤销与删除同成员的断开 |
 | `GET /internal/v1/connections/{id}/client-metadata` | 无（公开） | 客户端元数据文档：`client_id`（文档自己的地址）、`client_name`、`redirect_uris`（`IDP_BRIDGE_REDIRECT_URI`）、`grant_types`、`response_types`、`token_endpoint_auth_method: none`；404 对不是 `cimd` 的连接 |
 
 ### 5.2 数据库、建库与角色
@@ -136,6 +140,32 @@ kubectl -n idp-mcp-bridge create secret generic idp-mcp-bridge-database \
 | `client_identity_unsupported` | 对方不支持客户端元数据文档（`client_id_metadata_document_supported`），而连接没有开 `dynamicRegistration`；或预注册客户端的认证方式桥做不了（只做 `client_secret_basic`、`client_secret_post`） |
 | `pkce_unsupported` | 对方的元数据没有在 `code_challenge_methods_supported` 里列 `S256`（MCP 要求客户端拒绝这样的服务器；官方 SDK 不查） |
 | 回调 `iss_mismatch` / `iss_missing` | 回调里的 `iss` 不是钉死的 issuer（授权服务器混淆），或对方声明发 `iss`（`authorization_response_iss_parameter_supported`）却没发 |
+
+### 5.6 评审账号（目录、评审与漂移探测用）
+
+很多第三方连 `tools/list` 都要令牌，而网关的登记、评审、漂移探测没有成员。每条 `oauth` 连接可以有**一个评审账号**，是**运维**授权的，**只用于 `tools/list`，从不用于 `tools/call`**（成员的调用只带成员自己的令牌；评审账号存在也不会让没有授权的成员的调用发出去）。
+
+**评审账号应当是什么**：第三方那里**专门为此建立的账号**，不是任何人的个人账号（成员离职不应让目录坏掉，个人账号的权限也不该借给目录），**权限是能列出工具的最小**（只读；不能访问成员的数据；有"仅元数据"之类的范围就用它），名下没有数据。在连接文件里写 `authorization.reviewerScopes`（缺省用 `scopes`）。
+
+```bash
+# 1. 配置谁可以授权：一个 realm 角色（可再限定一个租户）；不设就没有人
+IDP_BRIDGE_REVIEWER_ROLE=idp-reviewer          # 给负责目录的运维的 realm 角色；令牌的 roles 声明里要有它
+IDP_BRIDGE_REVIEWER_TENANT=<运维的租户>        # 可选
+# 2. Workspace 的页面（W1）里，有这个角色的运维对每条连接看到"评审账号"的状态，点"授权"：
+#    POST /internal/v1/connections/{id}/reviewer/authorization  →  跳到第三方，**用那个专门的账号**登录并同意
+#    回到回调页 → POST /internal/v1/connections/{id}/callback（与成员的相同）
+# 3. 在网关里 discover / 重新评审：现在列表带评审账号的令牌
+# 4. 换账号、撤销：DELETE /internal/v1/connections/{id}/reviewer/grant（向第三方撤销再删除），再授权新的
+```
+
+- 授权存在授权库里，密封，与任何成员的授权分开；同一个运维自己连接这个服务（成员授权）与授权评审账号互不影响。
+- 评审令牌的刷新、轮换与成员的一样（行锁，一次只有一个副本刷新）；刷新令牌被对方拒绝时评审授权被删除，目录退回"不带令牌"，`discover` 会得到 502 "没有授权好的评审账号"：重新授权即可。
+- 状态在列表里（只给有评审角色的调用者）：`connected`、`not_connected`、`reauthorization_required`（原因 `issuer_changed`、`expired`）。
+- 撤下连接（`revoke --connection C`）两种授权都删；成员离职（`revoke --tenant --member`）不动评审账号。
+
+### 5.7 `Mcp-Param-*` 头
+
+工具可以在输入 schema 里用 `x-mcp-header` 声明某些参数要镜像进 `Mcp-Param-<名>` 头（MCP 2026-07-28，SEP-2243）。桥按**最后一次列出的工具定义**和调用的参数算出这些头发给第三方（规则与上限见 ADR D34），**不复制网关请求里的任何头**。定义来自每次 `tools/list`；一个调用遇到目录里没有的工具（或目录超过 5 分钟）会先刷新一次（用评审账号；每条连接至多每 30 秒由调用引起一次，熔断器开着或超出连接限流时不刷新），仍然未知则**不带这些头照样发出**。工具有无效的 `x-mcp-header` 注解（类型是 number、名字不是 token、重名、不在 `properties` 一路可达的位置）则这个工具没有头。参数太长放不进头（值编码后超过 1024 字节、超过 16 个头、名字超过 128 字节）：调用被拒绝，模型读到哪里太长，第三方没有收到请求。
 
 ## 6. 轮换
 

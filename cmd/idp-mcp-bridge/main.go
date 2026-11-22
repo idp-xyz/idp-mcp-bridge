@@ -31,6 +31,8 @@
 //	IDP_BRIDGE_OIDC_ISSUER       Keycloak's realm: the Workspace's calls to the internal API are verified against its keys
 //	IDP_BRIDGE_OIDC_JWKS_URL     its keys (default <issuer>/protocol/openid-connect/certs); https, or http with
 //	IDP_BRIDGE_OIDC_ALLOW_HTTP   =true; IDP_BRIDGE_OIDC_CA_FILE adds a CA for it
+//	IDP_BRIDGE_REVIEWER_ROLE     the realm role (in the `roles` claim, IDP_BRIDGE_ROLES_CLAIM) of the operators who may authorize reviewer
+//	                             accounts; IDP_BRIDGE_REVIEWER_TENANT narrows it to one tenant. No default: unset, no one can
 //	IDP_BRIDGE_API_AUDIENCE      what the Workspace's token is exchanged for (its `aud`)
 //	IDP_BRIDGE_WORKSPACE_CLIENT  the only client (`azp`) whose token is accepted; IDP_BRIDGE_TENANT_CLAIM names the tenant claim (tenant_id)
 //
@@ -114,7 +116,8 @@ func main() {
 	opts := app.Options{BaseURL: s.baseURL, CallerKeysPEM: s.callerKeys, Version: version, HTTP: httpClient,
 		MaxResult: s.maxResult, MaxStream: s.maxStream, CallTimeout: s.callTimeout}
 	met := bridge.NewMetrics()
-	var tokens auth.TokenSource = auth.NoTokens{} // B1's, for a bridge with no oauth connection
+	var tokens auth.TokenSource = auth.NoTokens{}        // B1's, for a bridge with no oauth connection
+	var reviewer auth.ReviewerSource = auth.NoReviewer{} // B1's: listings go out without a token
 	var apiSvc api.Service = api.Unimplemented{}
 	var apiAuth api.Authenticator = api.Unimplemented{}
 	if hasOAuth(conns) || sub == "revoke" || sub == "reseal" {
@@ -143,7 +146,7 @@ func main() {
 		fatal("unknown command", sub, "(check-config, migrate, ensure-login, revoke, reseal; no argument runs the server)")
 	}
 	if svc != nil {
-		tokens, apiSvc = svc, svc
+		tokens, apiSvc, reviewer = svc, svc, oauth.ReviewerSource{S: svc}
 		if apiAuth, err = os_.verifier(); err != nil {
 			fatal(err)
 		}
@@ -163,7 +166,7 @@ func main() {
 			}
 		}()
 	}
-	opts.Deps = bridge.Deps{Tokens: tokens, Reviewer: auth.NoReviewer{}, Log: log, Metrics: met}
+	opts.Deps = bridge.Deps{Tokens: tokens, Reviewer: reviewer, Log: log, Metrics: met}
 	handler, err := app.Handler(conns, opts)
 	if err != nil {
 		fatal(err)

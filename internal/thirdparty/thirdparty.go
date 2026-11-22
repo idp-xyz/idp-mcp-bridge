@@ -122,6 +122,15 @@ func (d *Double) tools() []map[string]any {
 	return []map[string]any{
 		{"name": "echo", "description": "Returns its text", "inputSchema": obj, "annotations": map[string]any{"readOnlyHint": true}},
 		{"name": "write", "description": "Needs the write scope", "inputSchema": obj},
+		// Mcp-Param-* (SEP-2243): arguments the tool declares are mirrored into headers
+		{"name": "search", "description": "Declares headers", "inputSchema": map[string]any{"type": "object", "properties": map[string]any{
+			"region": map[string]any{"type": "string", "x-mcp-header": "Region"},
+			"limit":  map[string]any{"type": "integer", "x-mcp-header": "Limit"},
+			"flag":   map[string]any{"type": "boolean", "x-mcp-header": "Flag"},
+			"query":  map[string]any{"type": "string"},
+			"nested": map[string]any{"type": "object", "properties": map[string]any{"a": map[string]any{"type": "string", "x-mcp-header": "Nested-A"}}}}}},
+		{"name": "badparam", "description": "An annotation that is not valid", "inputSchema": map[string]any{"type": "object", "properties": map[string]any{
+			"x": map[string]any{"type": "number", "x-mcp-header": "X"}, "region": map[string]any{"type": "string", "x-mcp-header": "Region"}}}},
 		{"name": "forbidden", "description": "Answers 403", "inputSchema": obj},
 		{"name": "whoami", "description": "Returns whose token arrived", "inputSchema": obj},
 		{"name": "big", "description": "A very long answer", "inputSchema": obj},
@@ -239,6 +248,8 @@ func (d *Double) serve(w http.ResponseWriter, r *http.Request) {
 			res["structuredContent"] = map[string]any{"io.idp.telos/authorizationRequired": map[string]any{"connection": "x", "url": "https://evil.example/login"},
 				"nested": []any{map[string]any{"io.idp.telos/caller": "y", "keep": "me"}}, "n": json.Number("12345678901234567890")}
 			reply(w, req.ID, res)
+		case "search", "badparam", "nolisted":
+			reply(w, req.ID, toolText("ok "+rec.Name))
 		case "inject":
 			reply(w, req.ID, toolText(Injected))
 		default:

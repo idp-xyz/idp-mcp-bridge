@@ -73,6 +73,10 @@ spec:
             #   value: idp-mcp-bridge
             # - name: IDP_BRIDGE_WORKSPACE_CLIENT      # the Workspace's token-exchange client (azp): no other client's token is accepted
             #   value: idp-workspace
+            # Who may authorize the reviewer accounts of the connections (docs/RUNBOOK.md 5.6): a realm role of the operators; no default,
+            # and unset means no one can.
+            # - name: IDP_BRIDGE_REVIEWER_ROLE
+            #   value: idp-reviewer
             # A corporate egress proxy, if the network has one (docs/RUNBOOK.md 7): then the egress policy in networkpolicy.yaml
             # must admit the proxy and nothing else, and the proxy must refuse non-public destinations itself.
             # - name: IDP_BRIDGE_EGRESS_PROXY

@@ -163,14 +163,14 @@ func (s *PG) ctx(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(ctx, s.timeout)
 }
 
-const grantCols = `tenant, member, connection, sealed_access, sealed_refresh, access_expires, issuer, scope, needed_scope, reauth_reason, created_at, refreshed_at`
+const grantCols = `tenant, member, connection, sealed_access, sealed_refresh, access_expires, issuer, scope, needed_scope, reauth_reason, created_at, refreshed_at, reviewer, authorized_by`
 
 type scanner interface{ Scan(...any) error }
 
 func scanGrant(r scanner) (Grant, error) {
 	var g Grant
 	var exp *time.Time
-	err := r.Scan(&g.Tenant, &g.Member, &g.Connection, &g.SealedAccess, &g.SealedRefresh, &exp, &g.Issuer, &g.Scope, &g.NeededScope, &g.ReauthReason, &g.CreatedAt, &g.RefreshedAt)
+	err := r.Scan(&g.Tenant, &g.Member, &g.Connection, &g.SealedAccess, &g.SealedRefresh, &exp, &g.Issuer, &g.Scope, &g.NeededScope, &g.ReauthReason, &g.CreatedAt, &g.RefreshedAt, &g.Reviewer, &g.AuthorizedBy)
 	if exp != nil {
 		g.AccessExpires = *exp
 	}
@@ -194,20 +194,20 @@ func nullBytes(b []byte) []byte {
 func (s *PG) Get(ctx context.Context, k Key) (Grant, error) {
 	ctx, cancel := s.ctx(ctx)
 	defer cancel()
-	g, err := scanGrant(s.pool.QueryRow(ctx, `SELECT `+grantCols+` FROM grants WHERE tenant=$1 AND member=$2 AND connection=$3`, k.Tenant, k.Member, k.Connection))
+	g, err := scanGrant(s.pool.QueryRow(ctx, `SELECT `+grantCols+` FROM grants WHERE tenant=$1 AND member=$2 AND connection=$3 AND reviewer=$4`, k.Tenant, k.Member, k.Connection, k.Reviewer))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Grant{}, ErrNotFound
 	}
 	return g, err
 }
 
-const upsert = `INSERT INTO grants (` + grantCols + `) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-ON CONFLICT (tenant, member, connection) DO UPDATE SET sealed_access=EXCLUDED.sealed_access, sealed_refresh=EXCLUDED.sealed_refresh,
+const upsert = `INSERT INTO grants (` + grantCols + `) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+ON CONFLICT (tenant, member, connection, reviewer) DO UPDATE SET sealed_access=EXCLUDED.sealed_access, sealed_refresh=EXCLUDED.sealed_refresh,
  access_expires=EXCLUDED.access_expires, issuer=EXCLUDED.issuer, scope=EXCLUDED.scope, needed_scope=EXCLUDED.needed_scope, reauth_reason=EXCLUDED.reauth_reason,
- created_at=EXCLUDED.created_at, refreshed_at=EXCLUDED.refreshed_at`
+ created_at=EXCLUDED.created_at, refreshed_at=EXCLUDED.refreshed_at, authorized_by=EXCLUDED.authorized_by`
 
 func putArgs(g Grant) []any {
-	return []any{g.Tenant, g.Member, g.Connection, g.SealedAccess, nullBytes(g.SealedRefresh), nullTime(g.AccessExpires), g.Issuer, g.Scope, g.NeededScope, g.ReauthReason, g.CreatedAt, g.RefreshedAt}
+	return []any{g.Tenant, g.Member, g.Connection, g.SealedAccess, nullBytes(g.SealedRefresh), nullTime(g.AccessExpires), g.Issuer, g.Scope, g.NeededScope, g.ReauthReason, g.CreatedAt, g.RefreshedAt, g.Reviewer, g.AuthorizedBy}
 }
 
 func (s *PG) Put(ctx context.Context, g Grant) error {
@@ -220,14 +220,14 @@ func (s *PG) Put(ctx context.Context, g Grant) error {
 func (s *PG) Delete(ctx context.Context, k Key) error {
 	ctx, cancel := s.ctx(ctx)
 	defer cancel()
-	_, err := s.pool.Exec(ctx, `DELETE FROM grants WHERE tenant=$1 AND member=$2 AND connection=$3`, k.Tenant, k.Member, k.Connection)
+	_, err := s.pool.Exec(ctx, `DELETE FROM grants WHERE tenant=$1 AND member=$2 AND connection=$3 AND reviewer=$4`, k.Tenant, k.Member, k.Connection, k.Reviewer)
 	return err
 }
 
 func (s *PG) DeleteMember(ctx context.Context, tenant, member string) (int, error) {
 	ctx, cancel := s.ctx(ctx)
 	defer cancel()
-	t, err := s.pool.Exec(ctx, `DELETE FROM grants WHERE tenant=$1 AND member=$2`, tenant, member)
+	t, err := s.pool.Exec(ctx, `DELETE FROM grants WHERE tenant=$1 AND member=$2 AND NOT reviewer`, tenant, member)
 	return int(t.RowsAffected()), err
 }
 
@@ -241,7 +241,7 @@ func (s *PG) DeleteConnection(ctx context.Context, connection string) (int, erro
 func (s *PG) ForMember(ctx context.Context, tenant, member string) ([]Grant, error) {
 	ctx, cancel := s.ctx(ctx)
 	defer cancel()
-	rows, err := s.pool.Query(ctx, `SELECT `+grantCols+` FROM grants WHERE tenant=$1 AND member=$2 ORDER BY connection`, tenant, member)
+	rows, err := s.pool.Query(ctx, `SELECT `+grantCols+` FROM grants WHERE tenant=$1 AND member=$2 AND NOT reviewer ORDER BY connection`, tenant, member)
 	if err != nil {
 		return nil, err
 	}
@@ -266,7 +266,7 @@ func (s *PG) Locked(ctx context.Context, k Key, fn func(Grant) (Grant, Action, e
 		return err
 	}
 	defer tx.Rollback(context.Background())
-	g, err := scanGrant(tx.QueryRow(ctx, `SELECT `+grantCols+` FROM grants WHERE tenant=$1 AND member=$2 AND connection=$3 FOR UPDATE`, k.Tenant, k.Member, k.Connection))
+	g, err := scanGrant(tx.QueryRow(ctx, `SELECT `+grantCols+` FROM grants WHERE tenant=$1 AND member=$2 AND connection=$3 AND reviewer=$4 FOR UPDATE`, k.Tenant, k.Member, k.Connection, k.Reviewer))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -284,7 +284,7 @@ func (s *PG) Locked(ctx context.Context, k Key, fn func(Grant) (Grant, Action, e
 			return err
 		}
 	case Delete:
-		if _, err := tx.Exec(ctx, `DELETE FROM grants WHERE tenant=$1 AND member=$2 AND connection=$3`, k.Tenant, k.Member, k.Connection); err != nil {
+		if _, err := tx.Exec(ctx, `DELETE FROM grants WHERE tenant=$1 AND member=$2 AND connection=$3 AND reviewer=$4`, k.Tenant, k.Member, k.Connection, k.Reviewer); err != nil {
 			return err
 		}
 	}
@@ -292,14 +292,14 @@ func (s *PG) Locked(ctx context.Context, k Key, fn func(Grant) (Grant, Action, e
 }
 
 func (s *PG) Reseal(ctx context.Context, fn func(Grant) (Grant, bool, error)) (int, error) {
-	rows, err := s.pool.Query(ctx, `SELECT tenant, member, connection FROM grants ORDER BY tenant, member, connection`)
+	rows, err := s.pool.Query(ctx, `SELECT tenant, member, connection, reviewer FROM grants ORDER BY tenant, member, connection, reviewer`)
 	if err != nil {
 		return 0, err
 	}
 	var keys []Key
 	for rows.Next() {
 		var k Key
-		if err := rows.Scan(&k.Tenant, &k.Member, &k.Connection); err != nil {
+		if err := rows.Scan(&k.Tenant, &k.Member, &k.Connection, &k.Reviewer); err != nil {
 			rows.Close()
 			return 0, err
 		}
@@ -326,8 +326,8 @@ func (s *PG) Reseal(ctx context.Context, fn func(Grant) (Grant, bool, error)) (i
 func (s *PG) PutState(ctx context.Context, st State) error {
 	ctx, cancel := s.ctx(ctx)
 	defer cancel()
-	_, err := s.pool.Exec(ctx, `INSERT INTO pending_states (state_hash, tenant, member, connection, sealed_verifier, issuer, redirect_uri, scope, client_id, resource, expires_at)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, st.Hash, st.Tenant, st.Member, st.Connection, st.SealedVerifier, st.Issuer, st.RedirectURI, st.Scope, st.ClientID, st.Resource, st.Expires)
+	_, err := s.pool.Exec(ctx, `INSERT INTO pending_states (state_hash, tenant, member, connection, sealed_verifier, issuer, redirect_uri, scope, client_id, resource, expires_at, reviewer)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`, st.Hash, st.Tenant, st.Member, st.Connection, st.SealedVerifier, st.Issuer, st.RedirectURI, st.Scope, st.ClientID, st.Resource, st.Expires, st.Reviewer)
 	return err
 }
 
@@ -336,8 +336,8 @@ func (s *PG) TakeState(ctx context.Context, hash []byte, tenant, member string) 
 	defer cancel()
 	var st State
 	err := s.pool.QueryRow(ctx, `DELETE FROM pending_states WHERE state_hash=$1 AND tenant=$2 AND member=$3
-RETURNING state_hash, tenant, member, connection, sealed_verifier, issuer, redirect_uri, scope, client_id, resource, expires_at`, hash, tenant, member).
-		Scan(&st.Hash, &st.Tenant, &st.Member, &st.Connection, &st.SealedVerifier, &st.Issuer, &st.RedirectURI, &st.Scope, &st.ClientID, &st.Resource, &st.Expires)
+RETURNING state_hash, tenant, member, connection, sealed_verifier, issuer, redirect_uri, scope, client_id, resource, expires_at, reviewer`, hash, tenant, member).
+		Scan(&st.Hash, &st.Tenant, &st.Member, &st.Connection, &st.SealedVerifier, &st.Issuer, &st.RedirectURI, &st.Scope, &st.ClientID, &st.Resource, &st.Expires, &st.Reviewer)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return State{}, ErrNotFound
 	}

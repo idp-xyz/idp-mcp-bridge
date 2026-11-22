@@ -33,6 +33,8 @@ type oauthSettings struct {
 	oidcIssuer, jwksURL, audience, workspaceClient, tenantClaim string
 	allowHTTP                                                   bool
 	caFile                                                      string
+	// the operators who may authorize reviewer accounts (ADR-0001 D33): no default, unset means no one
+	reviewerRole, reviewerTenant, rolesClaim string
 }
 
 func hasOAuth(cs []config.Connection) bool {
@@ -91,6 +93,11 @@ func loadOAuthSettings(getenv func(string) string, testOrigins map[string]bool) 
 	o.tenantClaim = env(getenv, "IDP_BRIDGE_TENANT_CLAIM", "tenant_id")
 	o.allowHTTP = getenv("IDP_BRIDGE_OIDC_ALLOW_HTTP") == "true"
 	o.caFile = getenv("IDP_BRIDGE_OIDC_CA_FILE")
+	o.reviewerRole, o.reviewerTenant = getenv("IDP_BRIDGE_REVIEWER_ROLE"), getenv("IDP_BRIDGE_REVIEWER_TENANT")
+	o.rolesClaim = env(getenv, "IDP_BRIDGE_ROLES_CLAIM", "roles")
+	if o.reviewerRole == "" && o.reviewerTenant != "" {
+		return nil, errors.New("IDP_BRIDGE_REVIEWER_TENANT is set without IDP_BRIDGE_REVIEWER_ROLE: the tenant narrows the role, and without a role no one is a reviewer")
+	}
 	for k, v := range map[string]string{"IDP_BRIDGE_OIDC_ISSUER": o.oidcIssuer, "IDP_BRIDGE_API_AUDIENCE": o.audience, "IDP_BRIDGE_WORKSPACE_CLIENT": o.workspaceClient} {
 		if v == "" {
 			return nil, fmt.Errorf("%s is not set: the Workspace's calls to the internal API are verified against Keycloak (ADR-0001 D28)", k)
@@ -128,7 +135,7 @@ func (o *oauthSettings) verifier() (*idauth.Verifier, error) {
 		return nil, err
 	}
 	return &idauth.Verifier{Issuer: o.oidcIssuer, Audience: o.audience, AuthorizedParty: o.workspaceClient, TenantClaim: o.tenantClaim,
-		Keys: &idauth.JWKS{URL: o.jwksURL, HTTP: hc}}, nil
+		ReviewerRole: o.reviewerRole, ReviewerTenant: o.reviewerTenant, RolesClaim: o.rolesClaim, Keys: &idauth.JWKS{URL: o.jwksURL, HTTP: hc}}, nil
 }
 
 // openStore opens the store as the service role. It does not migrate and runs no DDL: the schema is the migration Job's

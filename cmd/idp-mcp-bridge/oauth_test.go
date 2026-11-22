@@ -129,3 +129,22 @@ func TestTheDatabaseCommandsNeedTheOwnersURLAndNothingElse(t *testing.T) {
 		t.Fatalf("%d %q", code, msg)
 	}
 }
+
+func TestTheReviewerRoleHasNoDefaultAndATenantNeedsARole(t *testing.T) {
+	o, err := loadOAuthSettings(envOf(oauthEnv(t)), nil)
+	if err != nil || o.reviewerRole != "" || o.reviewerTenant != "" || o.rolesClaim != "roles" {
+		t.Fatalf("%+v %v", o, err)
+	}
+	e := oauthEnv(t)
+	e["IDP_BRIDGE_REVIEWER_ROLE"], e["IDP_BRIDGE_REVIEWER_TENANT"], e["IDP_BRIDGE_ROLES_CLAIM"] = "idp-reviewer", "acme", "realm_roles"
+	if o, err = loadOAuthSettings(envOf(e), nil); err != nil || o.reviewerRole != "idp-reviewer" || o.reviewerTenant != "acme" || o.rolesClaim != "realm_roles" {
+		t.Fatalf("%+v %v", o, err)
+	}
+	if v, _ := o.verifier(); v.ReviewerRole != "idp-reviewer" || v.ReviewerTenant != "acme" || v.RolesClaim != "realm_roles" {
+		t.Fatal("the verifier does not carry the settings")
+	}
+	delete(e, "IDP_BRIDGE_REVIEWER_ROLE")
+	if _, err := loadOAuthSettings(envOf(e), nil); err == nil || !strings.Contains(err.Error(), "IDP_BRIDGE_REVIEWER_TENANT") {
+		t.Fatalf("%v", err)
+	}
+}

@@ -21,6 +21,9 @@ var ErrNoToken = errors.New("no token for this member")
 type Subject struct {
 	Tenant string
 	Member string
+	// Reviewer is set only by the API's authenticator, from the token's realm roles (and tenant): the caller may authorize and
+	// disconnect connections' reviewer accounts (ADR-0001 D33). The gateway's assertion never sets it.
+	Reviewer bool
 }
 
 // TokenSource gives the token to call a connection with on behalf of a member. A token it returns is an access token
@@ -46,8 +49,14 @@ type StepUpper interface {
 // and drift probes (plan section 2, item 8). It is an account the operator authorized for this connection, used for
 // discovery and probes only and never for a member's call.
 type ReviewerSource interface {
-	// Token returns the reviewer account's token, or "" for a connection that needs none.
+	// Token returns the reviewer account's token, "" for a connection that needs none, or ErrNoToken if the connection has no
+	// usable reviewer grant (the listing then goes out without a token).
 	Token(ctx context.Context, connection string) (string, error)
+}
+
+// ReviewerRefresher is what a ReviewerSource may also do: give a new token after the third party refused rejected (HTTP 401).
+type ReviewerRefresher interface {
+	Refresh(ctx context.Context, connection string, rejected string) (string, error)
 }
 
 // NoTokens is B1's TokenSource: nobody has a token.

@@ -91,3 +91,21 @@ func TestTheKeyFileIsValidatedStrictly(t *testing.T) {
 		t.Error("no path")
 	}
 }
+
+// ADR-0001 D33: a reviewer grant never opens as a member's, nor the other way round.
+func TestAReviewerSealedValueDoesNotOpenAsAMembersAndNeitherTheOtherWayRound(t *testing.T) {
+	k, _ := Parse([]byte("k1:" + key(1)))
+	rv := grants.Key{Connection: "notes", Reviewer: true}
+	member := grants.Key{Connection: "notes"}
+	sealed, _ := k.Seal([]byte("reviewer token"), rv)
+	if pt, err := k.Open(sealed, rv); err != nil || string(pt) != "reviewer token" {
+		t.Fatalf("%q %v", pt, err)
+	}
+	if _, err := k.Open(sealed, member); !errors.Is(err, ErrOpen) {
+		t.Fatalf("a reviewer's token opened as a member's: %v", err)
+	}
+	ms, _ := k.Seal([]byte("x"), member)
+	if _, err := k.Open(ms, rv); !errors.Is(err, ErrOpen) {
+		t.Fatalf("a member's token opened as a reviewer's: %v", err)
+	}
+}

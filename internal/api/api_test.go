@@ -21,6 +21,8 @@ func do(h http.Handler, method, path, bearer, body string) *httptest.ResponseRec
 }
 
 var routes = [][2]string{
+	{"POST", "/internal/v1/connections/github/reviewer/authorization"},
+	{"DELETE", "/internal/v1/connections/github/reviewer/grant"},
 	{"GET", "/internal/v1/connections"},
 	{"POST", "/internal/v1/connections/github/authorization"},
 	{"POST", "/internal/v1/connections/github/callback"},
@@ -106,6 +108,12 @@ func (recorder) Start(context.Context, auth.Subject, string) (Authorization, err
 func (recorder) Finish(context.Context, auth.Subject, string, Finish) error { return ErrNotImplemented }
 func (recorder) Disconnect(context.Context, auth.Subject, string) error     { return ErrNotImplemented }
 
+func (recorder) StartReviewer(context.Context, auth.Subject, string) (Authorization, error) {
+	return Authorization{}, ErrNotImplemented
+}
+func (recorder) DisconnectReviewer(context.Context, auth.Subject, string) error {
+	return ErrNotImplemented
+}
 func (recorder) ClientMetadata(string) (map[string]any, error) {
 	return map[string]any{"client_id": "https://w.example.com/c.json"}, nil
 }

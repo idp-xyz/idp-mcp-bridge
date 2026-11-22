@@ -50,10 +50,19 @@ type ConnectionStatus struct {
 	ID     string `json:"id"`
 	Title  string `json:"title"`
 	Status string `json:"status"`
+	// Reviewer is the connection's reviewer account, shown to a caller with the reviewer role only (ADR-0001 D33).
+	Reviewer *ReviewerStatus `json:"reviewer,omitempty"`
 	// Reason is a code from a fixed set, with reauthorization_required: insufficient_scope, issuer_changed, expired.
 	Reason string `json:"reason,omitempty"`
 	// Scope is what the member granted, space separated.
 	Scope string `json:"scope,omitempty"`
+}
+
+// ReviewerStatus is the state of a connection's reviewer account: the statuses of a member's, and no more.
+type ReviewerStatus struct {
+	Status string `json:"status"`
+	Reason string `json:"reason,omitempty"`
+	Scope  string `json:"scope,omitempty"`
 }
 
 // Authorization is the answer to a start: where the Workspace sends the member's browser. The URL is built by the
@@ -90,6 +99,10 @@ type Service interface {
 	Start(ctx context.Context, who auth.Subject, connection string) (Authorization, error)
 	Finish(ctx context.Context, who auth.Subject, connection string, f Finish) error
 	Disconnect(ctx context.Context, who auth.Subject, connection string) error
+	// StartReviewer and DisconnectReviewer are Start and Disconnect for the connection's reviewer account; a caller without the
+	// reviewer role is an *Error with status 403 and code forbidden.
+	StartReviewer(ctx context.Context, who auth.Subject, connection string) (Authorization, error)
+	DisconnectReviewer(ctx context.Context, who auth.Subject, connection string) error
 	// ClientMetadata is the client metadata document of a connection that uses one (OAuth Client ID Metadata Document): its
 	// content is the bridge's, built from its configuration, and the Workspace serves it at the connection's document address.
 	// It holds nothing secret. An *Error with status 404 if the connection has none.
@@ -111,6 +124,12 @@ func (Unimplemented) Start(context.Context, auth.Subject, string) (Authorization
 	return Authorization{}, ErrNotImplemented
 }
 func (Unimplemented) Finish(context.Context, auth.Subject, string, Finish) error {
+	return ErrNotImplemented
+}
+func (Unimplemented) StartReviewer(context.Context, auth.Subject, string) (Authorization, error) {
+	return Authorization{}, ErrNotImplemented
+}
+func (Unimplemented) DisconnectReviewer(context.Context, auth.Subject, string) error {
 	return ErrNotImplemented
 }
 func (Unimplemented) Disconnect(context.Context, auth.Subject, string) error {
@@ -142,6 +161,20 @@ func New(a Authenticator, s Service) *Handler {
 		a, err := h.Svc.Start(r.Context(), who, r.PathValue("id"))
 		if err == nil {
 			reply(w, http.StatusOK, a)
+		}
+		return err
+	})
+	h.route("POST /internal/v1/connections/{id}/reviewer/authorization", func(w http.ResponseWriter, r *http.Request, who auth.Subject) error {
+		a, err := h.Svc.StartReviewer(r.Context(), who, r.PathValue("id"))
+		if err == nil {
+			reply(w, http.StatusOK, a)
+		}
+		return err
+	})
+	h.route("DELETE /internal/v1/connections/{id}/reviewer/grant", func(w http.ResponseWriter, r *http.Request, who auth.Subject) error {
+		err := h.Svc.DisconnectReviewer(r.Context(), who, r.PathValue("id"))
+		if err == nil {
+			w.WriteHeader(http.StatusNoContent)
 		}
 		return err
 	})

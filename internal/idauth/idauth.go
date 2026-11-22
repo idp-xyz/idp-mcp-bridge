@@ -41,6 +41,10 @@ type Verifier struct {
 	TenantClaim string
 	Keys        *JWKS
 	Leeway      time.Duration
+	// ReviewerRole is the realm role (in RolesClaim) that makes a caller an operator who may authorize reviewer accounts; empty: no
+	// one. ReviewerTenant, if set, is the only tenant whose holders of the role are (ADR-0001 D33).
+	ReviewerRole, ReviewerTenant string
+	RolesClaim                   string // default "roles"
 }
 
 // Authenticate verifies a bearer token and returns the member it names: the subject and the tenant claim. Every failure is
@@ -64,7 +68,21 @@ func (v *Verifier) Authenticate(ctx context.Context, bearer string) (auth.Subjec
 	if sub == "" || tenant == "" || azp == "" || azp != v.AuthorizedParty {
 		return auth.Subject{}, api.ErrUnauthenticated
 	}
-	return auth.Subject{Tenant: tenant, Member: sub}, nil
+	who := auth.Subject{Tenant: tenant, Member: sub}
+	if v.ReviewerRole != "" && (v.ReviewerTenant == "" || v.ReviewerTenant == tenant) {
+		claim := v.RolesClaim
+		if claim == "" {
+			claim = "roles"
+		}
+		if roles, ok := claims[claim].([]any); ok {
+			for _, r := range roles {
+				if s, _ := r.(string); s == v.ReviewerRole {
+					who.Reviewer = true
+				}
+			}
+		}
+	}
+	return who, nil
 }
 
 // JWKS fetches and caches the signing keys of the realm.

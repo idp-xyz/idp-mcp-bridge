@@ -63,6 +63,7 @@ type Connection struct {
 	client  *upstream.Client
 	limiter *guard.Limiter
 	breaker *guard.Breaker
+	cat     catalog
 	d       Deps
 }
 
@@ -152,28 +153,78 @@ func (c *Connection) ListTools(ctx context.Context) (json.RawMessage, error) {
 	if wait := c.limiter.AllowConnection(); wait > 0 {
 		return fail(OutcomeRateLimited, &mcp.Error{Code: mcp.CodeInternal, Message: fmt.Sprintf("Too many requests to this connection; try again in %d seconds", seconds(wait)), Status: http.StatusTooManyRequests}, 0)
 	}
-	token := ""
-	if c.cfg.Authorization.Mode == config.AuthOAuth {
-		var err error
-		if token, err = c.d.Reviewer.Token(ctx, c.cfg.ID); err != nil {
-			return fail(OutcomeTokenError, &mcp.Error{Code: mcp.CodeInternal, Message: "The reviewer account's token is not available", Status: http.StatusBadGateway}, 0)
-		}
+	token, terr := c.reviewerToken(ctx)
+	if terr != nil {
+		return fail(OutcomeTokenError, &mcp.Error{Code: mcp.CodeInternal, Message: "The reviewer account's token is not available", Status: http.StatusBadGateway}, 0)
 	}
 	if ok, wait := c.breaker.Allow(); !ok {
 		return fail(OutcomeCircuitOpen, &mcp.Error{Code: mcp.CodeInternal, Message: fmt.Sprintf("The service is unavailable for now; try again in %d seconds", seconds(wait)), Status: http.StatusServiceUnavailable}, 0)
 	}
-	reply, err := c.client.ListTools(ctx, token)
+	reply, err := c.listTools(ctx, token)
 	c.settle(ctx, err)
 	if err != nil {
 		outcome, why := classify(err)
 		if errors.Is(err, upstream.ErrUnauthorized) {
 			// the listing needs a credential this connection has no reviewer account for (B3)
-			outcome, why = OutcomeNotConfigured, "the service wants a credential to list its tools, and no reviewer account is set up for it."
+			outcome, why = OutcomeNotConfigured, "the service wants a credential to list its tools, and the connection has no reviewer account whose authorization is good."
 		}
 		return fail(outcome, &mcp.Error{Code: mcp.CodeInternal, Message: "The service did not list its tools: " + why, Status: http.StatusBadGateway}, reply.Bytes)
 	}
+	c.cat.set(reply.Result, c.d.Now()) // what a call needs to know of the tools' Mcp-Param-* headers
 	c.record("tools/list", none, verdict{OutcomeOK, reply.Bytes}, start)
 	return reply.Result, nil
+}
+
+// reviewerToken is the reviewer account's token for a listing (never for a call: CallTool does not look here): "" for a connection
+// that needs none and for one whose reviewer account has no usable grant, in which case the listing goes out without a token and the
+// third party says whether that is enough. Any other error is the source's.
+func (c *Connection) reviewerToken(ctx context.Context) (string, error) {
+	if c.cfg.Authorization.Mode != config.AuthOAuth {
+		return "", nil
+	}
+	token, err := c.d.Reviewer.Token(ctx, c.cfg.ID)
+	if errors.Is(err, auth.ErrNoToken) {
+		return "", nil
+	}
+	return token, err
+}
+
+// listTools lists with the reviewer's token; if the third party answers 401 to it, the source gets one chance to give another.
+func (c *Connection) listTools(ctx context.Context, token string) (upstream.Reply, error) {
+	reply, err := c.client.ListTools(ctx, token)
+	if errors.Is(err, upstream.ErrUnauthorized) && token != "" {
+		if rf, ok := c.d.Reviewer.(auth.ReviewerRefresher); ok {
+			if fresh, rerr := rf.Refresh(ctx, c.cfg.ID, token); rerr == nil && fresh != "" {
+				return c.client.ListTools(ctx, fresh)
+			}
+		}
+	}
+	return reply, err
+}
+
+// paramHeaders computes the Mcp-Param-* headers of a call from its arguments and the tool's definition as last listed (ADR-0001 D34).
+// A tool the catalog does not know (or knows only from a listing older than the TTL) makes one refresh, if the connection is
+// healthy, within its limits and not refreshed a moment ago; if it is still unknown the call goes without such headers.
+func (c *Connection) paramHeaders(ctx context.Context, name string, args json.RawMessage) (http.Header, error) {
+	spec, known := c.cat.get(name, c.d.Now())
+	if !known {
+		c.refreshCatalog(ctx)
+		spec, _ = c.cat.get(name, c.d.Now())
+	}
+	return upstream.ParamHeaders(spec, args)
+}
+
+func (c *Connection) refreshCatalog(ctx context.Context) {
+	if c.breaker.State() != guard.Closed || !c.cat.mayRefresh(c.d.Now()) || c.limiter.AllowConnection() > 0 {
+		return
+	}
+	token, err := c.reviewerToken(ctx)
+	if err != nil {
+		return
+	}
+	if reply, err := c.listTools(ctx, token); err == nil {
+		c.cat.set(reply.Result, c.d.Now())
+	}
 }
 
 // settle tells the breaker how a call that was allowed ended.
@@ -222,7 +273,12 @@ func (c *Connection) CallTool(ctx context.Context, call mcp.Call) (json.RawMessa
 	if ok, wait := c.breaker.Allow(); !ok {
 		return end(OutcomeCircuitOpen, toolError(fmt.Sprintf("%s is not answering at the moment, so the call was not made. Try again in %d seconds, or answer without it.", c.cfg.Title, seconds(wait)), nil), 0)
 	}
-	reply, err := c.client.CallTool(ctx, token, call.Name, call.Arguments, call.Progress)
+	hdr, herr := c.paramHeaders(ctx, call.Name, call.Arguments)
+	if herr != nil {
+		c.breaker.Abort() // nothing was sent: says nothing about the third party
+		return end(OutcomeBadRequest, toolError("An argument of this tool is too long to be sent to "+c.cfg.Title+" in the header the tool asks for. Use a shorter value.", nil), 0)
+	}
+	reply, err := c.client.CallToolWithHeaders(ctx, token, call.Name, call.Arguments, call.Progress, hdr)
 	if errors.Is(err, upstream.ErrUnauthorized) && token != "" {
 		// 401: the token is not good (expired, revoked). The source gets one chance to give a new one; if it has none the
 		// member has to authorize again. Either way the answer of the first try is all the third party has heard.
@@ -235,7 +291,7 @@ func (c *Connection) CallTool(ctx context.Context, call mcp.Call) (json.RawMessa
 			c.breaker.Success()
 			return end(OutcomeTokenError, toolError("The credential for "+c.cfg.Title+" could not be renewed just now. Try again later.", nil), reply.Bytes)
 		}
-		reply, err = c.client.CallTool(ctx, fresh, call.Name, call.Arguments, call.Progress)
+		reply, err = c.client.CallToolWithHeaders(ctx, fresh, call.Name, call.Arguments, call.Progress, hdr)
 		if errors.Is(err, upstream.ErrUnauthorized) {
 			c.breaker.Success()
 			return end(OutcomeAuthorizationRequired, c.authorizationRequired(), reply.Bytes)

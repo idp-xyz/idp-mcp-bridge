@@ -415,7 +415,7 @@ connections:
 	}
 	// the check is not a blanket refusal: a name with only public answers is dialed, at the address that was checked
 	mcptest.Post(h, Path("good"), gw.CallBody(Audience(base, "good"), "alice", "acme", "echo", `{}`, ""), nil)
-	if len(dialed) != 1 || dialed[0] != "93.184.216.34:443" {
+	if len(dialed) == 0 || dialed[0] != "93.184.216.34:443" || dialed[len(dialed)-1] != dialed[0] { // the call, and the refresh of the tools' definitions it causes
 		t.Fatalf("dialed %v", dialed)
 	}
 }
@@ -485,6 +485,10 @@ func TestTheCircuitBreakerOpensAfterConsecutiveFailuresAndClosesAfterATrial(t *t
 		w, m := r.call("svc", "alice", "acme", "echo", `{"text":"x"}`)
 		return result(t, w, m)
 	}
+	// the catalog of the tools is known from a listing, so that a call does not make one of its own (ADR-0001 D34) and the requests
+	// the third party sees are the calls'
+	mcptest.Post(r.h, Path("svc"), mcptest.ListBody(), nil)
+	base := len(r.tp.Requests())
 	r.tp.Status = 503
 	for i := 0; i < 3; i++ {
 		if res := call(); res["isError"] != true || !strings.Contains(text(res), "HTTP 503") {
@@ -492,20 +496,20 @@ func TestTheCircuitBreakerOpensAfterConsecutiveFailuresAndClosesAfterATrial(t *t
 		}
 	}
 	// open: the fourth call is not made
-	if res := call(); !strings.Contains(text(res), "is not answering at the moment") || !strings.Contains(text(res), "30 seconds") || len(r.tp.Requests()) != 3 {
+	if res := call(); !strings.Contains(text(res), "is not answering at the moment") || !strings.Contains(text(res), "30 seconds") || len(r.tp.Requests()) != base+3 {
 		t.Fatalf("%v (%d requests)", res, len(r.tp.Requests()))
 	}
 	// the listing is behind the same breaker
-	if w, _ := mcptest.Post(r.h, Path("svc"), mcptest.ListBody(), nil); w.Code != http.StatusServiceUnavailable || len(r.tp.Requests()) != 3 {
+	if w, _ := mcptest.Post(r.h, Path("svc"), mcptest.ListBody(), nil); w.Code != http.StatusServiceUnavailable || len(r.tp.Requests()) != base+3 {
 		t.Fatalf("listing while open: %d", w.Code)
 	}
 	// after the pause one trial goes out; it fails, so it is open again for another pause
 	r.clock.Advance(31 * time.Second)
 	call()
-	if len(r.tp.Requests()) != 4 {
+	if len(r.tp.Requests()) != base+4 {
 		t.Fatalf("the trial: %d requests", len(r.tp.Requests()))
 	}
-	if res := call(); !strings.Contains(text(res), "is not answering") || len(r.tp.Requests()) != 4 {
+	if res := call(); !strings.Contains(text(res), "is not answering") || len(r.tp.Requests()) != base+4 {
 		t.Fatalf("%v", res)
 	}
 	// the third party recovers: the next trial closes the breaker
@@ -525,7 +529,7 @@ func TestTheCircuitBreakerOpensAfterConsecutiveFailuresAndClosesAfterATrial(t *t
 	for i := 0; i < 5; i++ {
 		call()
 	}
-	if len(r.tp.Requests()) != 11 {
+	if len(r.tp.Requests()) != base+11 {
 		t.Fatalf("%d requests: refusals by the third party opened the breaker", len(r.tp.Requests()))
 	}
 }

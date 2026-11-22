@@ -255,7 +255,7 @@ func TestMigrationsAreAppliedOnceByTheOwnerUnderALock(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	if total := counts[0] + counts[1] + counts[2] + counts[3]; total != 1 {
+	if total := counts[0] + counts[1] + counts[2] + counts[3]; total != 2 { // the two migrations, once each
 		t.Fatalf("the migration was applied %d times in all: %v", total, counts)
 	}
 }
@@ -311,6 +311,12 @@ func TestTheServerNeverMigratesAndRefusesASchemaThatIsNotTheOneItExpects(t *test
 		t.Fatal(err)
 	}
 	defer oc.Close(ctx)
+	if _, err := oc.Exec(ctx, `DELETE FROM schema_migrations WHERE version = 2`); err != nil { // one behind
+		t.Fatal(err)
+	}
+	if _, err := grants.Open(ctx, svc); err == nil || !strings.Contains(err.Error(), "binary needs") {
+		t.Fatalf("a schema one version behind: %v", err)
+	}
 	if _, err := oc.Exec(ctx, `DELETE FROM schema_migrations`); err != nil {
 		t.Fatal(err)
 	}
@@ -318,7 +324,7 @@ func TestTheServerNeverMigratesAndRefusesASchemaThatIsNotTheOneItExpects(t *test
 		t.Fatalf("a schema older than expected: %v", err)
 	}
 	// newer than expected
-	if _, err := oc.Exec(ctx, `INSERT INTO schema_migrations (version, name) VALUES (1, 'a'), (2, 'b')`); err != nil {
+	if _, err := oc.Exec(ctx, `INSERT INTO schema_migrations (version, name) VALUES (1, 'a'), (2, 'b'), (3, 'c')`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := grants.Open(ctx, svc); err == nil || !strings.Contains(err.Error(), "binary needs") {
@@ -342,5 +348,81 @@ func TestEnsureLoginMakesARoleThatIsNotAnOwnerAndRefusesBadNames(t *testing.T) {
 	defer unlock()
 	if err := grants.EnsureLogin(ctx, owner, "idp_bridge_it_svc", "it-service-password"); err != nil { // again: an update
 		t.Fatal(err)
+	}
+}
+
+// A connection's reviewer grant is a row of its own: the same person's member grant and the reviewer grant do not meet, offboarding a
+// member leaves it, withdrawing the connection takes it (ADR-0001 D33).
+func TestAReviewerGrantIsOfTheConnectionAndNeverOfAMember(t *testing.T) {
+	for name, mk := range stores(t) {
+		t.Run(name, func(t *testing.T) {
+			s, _ := mk()
+			member := grant("acme", "ops", "notes")
+			rv := grant("", "", "notes")
+			rv.Key.Reviewer, rv.AuthorizedBy, rv.SealedAccess = true, "acme/ops", []byte("reviewer-sealed")
+			if err := s.Put(ctx, member); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Put(ctx, rv); err != nil {
+				t.Fatal(err)
+			}
+			gm, _ := s.Get(ctx, member.Key)
+			gr, err := s.Get(ctx, rv.Key)
+			if err != nil || string(gm.SealedAccess) != "sealed-a" || string(gr.SealedAccess) != "reviewer-sealed" || !gr.Reviewer || gr.AuthorizedBy != "acme/ops" {
+				t.Fatalf("%+v %+v %v", gm, gr, err)
+			}
+			if list, _ := s.ForMember(ctx, "acme", "ops"); len(list) != 1 || list[0].Reviewer {
+				t.Fatalf("a member's list holds the reviewer grant: %+v", list)
+			}
+			// locked, updated and deleted by their own keys
+			if err := s.Locked(ctx, rv.Key, func(g grants.Grant) (grants.Grant, grants.Action, error) {
+				g.Scope = "changed"
+				return g, grants.Update, nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if gm, _ = s.Get(ctx, member.Key); gm.Scope != "read" {
+				t.Fatal("updating the reviewer grant changed the member's")
+			}
+			if n, _ := s.DeleteMember(ctx, "acme", "ops"); n != 1 {
+				t.Fatalf("%d", n)
+			}
+			if _, err := s.Get(ctx, rv.Key); err != nil {
+				t.Fatal("offboarding the member removed the reviewer grant")
+			}
+			_ = s.Put(ctx, member)
+			if err := s.Delete(ctx, rv.Key); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.Get(ctx, member.Key); err != nil {
+				t.Fatal("deleting the reviewer grant removed the member's")
+			}
+			_ = s.Put(ctx, rv)
+			if n, _ := s.DeleteConnection(ctx, "notes"); n != 2 {
+				t.Fatalf("withdrawing the connection removed %d grants, want both", n)
+			}
+		})
+	}
+}
+
+// The database itself refuses a row that is both or neither: a reviewer grant has no tenant and member, a member's has both.
+func TestTheDatabaseRefusesARowThatIsNeitherAMembersNorTheConnectionsReviewer(t *testing.T) {
+	if !pgtest.Enabled() {
+		t.Skip("IDP_TEST_PG_OWNER_URL not set (make test-integration)")
+	}
+	_, svc := pgtest.Scratch(t)
+	s, err := grants.Open(ctx, svc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	for name, g := range map[string]grants.Grant{
+		"a reviewer grant of a member":  func() grants.Grant { g := grant("acme", "bob", "notes"); g.Reviewer = true; return g }(),
+		"a member grant of nobody":      grant("", "", "notes"),
+		"a member grant with no member": grant("acme", "", "notes"),
+	} {
+		if err := s.Put(ctx, g); err == nil {
+			t.Errorf("%s: stored", name)
+		}
 	}
 }
