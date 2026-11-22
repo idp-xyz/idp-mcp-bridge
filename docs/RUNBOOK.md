@@ -37,13 +37,13 @@ kubectl -n idp-mcp-bridge rollout status deploy/idp-mcp-bridge
 # 注册服务与网关都设：指向桥的端点必须登记为 external（idp-mcp ADR-0001 D50），漏标是登记失败，不是悄悄的缺省
 IDP_BRIDGE_ENDPOINTS=http://idp-mcp-bridge.idp-mcp-bridge.svc.cluster.local:8680/mcp/
 # 登记（以 operator 的令牌）；class 之后不能改
-POST /api/v1/servers  {"displayName":"github","targetName":"github","endpoint":"http://idp-mcp-bridge.idp-mcp-bridge.svc.cluster.local:8680/mcp/github","class":"external","identity":"forward"}
+POST /api/v1/servers  {"displayName":"github","targetName":"github","endpoint":"http://idp-mcp-bridge.idp-mcp-bridge.svc.cluster.local:8680/mcp/github","class":"external"}
 POST /api/v1/servers/{id}/discover        # 经桥列出第三方的工具：不需要令牌的连接直接成功；要令牌的连接要先有评审账号（第 5.6 节），否则 502
 GET  /api/v1/servers/{id}/catalog         # 评审人读完整目录
 POST /api/v1/servers/{id}/approve         {"digest":"<看过的目录摘要>"}
 ```
 
-`identity` 的取值：**`forward`**（桥需要知道是哪个成员）。**这与网关现在的规则冲突，要等计划里的任务 G1**：idp-mcp ADR-0001 D50 要求 external 目标的 `identity` 是 `none`（登记时拒绝 `forward`），D51 a 规定 external 目标一律不发断言。G1 要把指向桥地址的外部上游改成发签名的断言（受众是桥的端点）。**在 G1 做完之前，桥的每个 `tools/call` 都是 403**（网关没有发断言），只有 `tools/list` 与 `server/discover`（不需要调用者）能通。端点必须与桥的受众逐字相同：多一个斜杠、`http` 写成 `https`、连接 id 不同，每个调用都是 403。
+`identity` **不写（缺省 `none`），不要写 `forward`**：idp-mcp ADR-0001 15.1（G1）让网关对指向桥地址（`IDP_BRIDGE_ENDPOINTS` 匹配）的外部上游发**签名的调用者断言**（受众是这个目标的端点，有效期 60 秒），external 目标的 `identity` 仍必须是 `none`，因为 `forward` 会发明文的调用者，登记时被拒绝。**网关没有 `IDP_GATEWAY_CALLER_KEY_FILE`（签名密钥）时，对桥的调用不发出**（`NOT_DELIVERED`）。端点必须与桥的受众逐字相同：多一个斜杠、`http` 写成 `https`、连接 id 不同，每个调用都是 403。**登记要求 idp-mcp 含 15.2**：此前注册服务要求端点以 `/mcp` 结尾，桥的 `/mcp/<连接 id>` 登记不了（平台验收 PATH O 发现）。
 
 **网关的签名**：网关设 `IDP_GATEWAY_CALLER_KEY_FILE`（P-256 私钥），公钥放进 ConfigMap `idp-mcp-bridge-gateway-caller-keys`。两边的时钟差不要超过 30 秒。
 
@@ -126,7 +126,7 @@ kubectl -n idp-mcp-bridge create secret generic idp-mcp-bridge-database \
 
 ### 5.4 撤销与成员离开
 
-- 成员自己断开：Workspace 的 `DELETE .../grant`。
+- 成员自己断开：Workspace 的 `DELETE .../grant`。**再授权**（重新连接、`reauthorization_required` 或 `insufficient_scope` 之后重新授权，评审账号同）会替换授权，被取代的刷新令牌与访问令牌在新授权存入之后向授权服务器撤销（尽力而为，失败只记日志里的码，不影响新授权；服务器没有撤销端点则不做；ADR D35）。
 - 运维：`idp-mcp-bridge revoke --tenant T --member M [--connection C]`：成员的授权（或这一条连接上的）逐条向授权服务器撤销（连接还在配置里、对方有撤销端点时，尽力而为），再删除；`idp-mcp-bridge revoke --connection C`：一条被撤下的连接的所有授权，直接删除（不向对方撤销：它们不按连接列出，连接多半已经不在文件里了）。命令需要与服务相同的数据库、密钥文件与（撤销要用的）连接文件设置。
 - **未做（记为开放）**：成员离开租户时自动清理。身份提供方不会通知桥，桥也不扫描；离职流程要调用 `revoke`。管理员撤销某个成员的授权也只有这条命令。
 
@@ -186,7 +186,7 @@ IDP_BRIDGE_REVIEWER_TENANT=<运维的租户>        # 可选
 
 | 现象 | 原因 |
 |---|---|
-| 每个 `tools/call` 都是 403，日志里 `caller assertion refused` | 看 `reason`：`made for ..., not for ...` 是端点与受众不是同一个字符串；`signed with a key this server does not hold` 是公钥没配或没轮换；`expired`/`issued in the future` 是时钟差；`no assertion` 是网关没发断言（G1 未做，或登记时 `identity` 不是 `forward`） |
+| 每个 `tools/call` 都是 403，日志里 `caller assertion refused` | 看 `reason`：`made for ..., not for ...` 是端点与受众不是同一个字符串；`signed with a key this server does not hold` 是公钥没配或没轮换；`expired`/`issued in the future` 是时钟差；`no assertion` 是网关没发断言（网关没有签名密钥，或这个端点不在 `IDP_BRIDGE_ENDPOINTS` 里） |
 | 启动退出，状态码 2 | 配置错误，stderr 写明（连接文件的哪一条哪一项、哪个环境变量） |
 | 工具调用答"连接 X 之前先在 Workspace 授权" | 这个成员没有授权；授权过期且不能刷新；刷新令牌被对方拒绝（授权已删除）；对方答 `insufficient_scope`（授权保留，要求更大的范围，列表里的原因是 `insufficient_scope`） |
 | 答"... is not answering at the moment" | 这条连接的熔断器开了（连续失败）；`idp_bridge_breaker_state` 为 1；等 `openSeconds`，第三方恢复后第一次调用就关上它 |

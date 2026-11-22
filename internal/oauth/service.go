@@ -397,7 +397,17 @@ func (s *Service) Finish(ctx context.Context, who auth.Subject, id string, f api
 	if err != nil {
 		return err
 	}
-	return s.Store.Put(ctx, g)
+	old, oerr := s.Store.Get(ctx, key) // the grant this one supersedes, if any
+	if err := s.Store.Put(ctx, g); err != nil {
+		return err
+	}
+	// The new grant is stored, and what happens next cannot undo it: the superseded tokens are revoked at the server, best effort
+	// (ADR-0001 D35), with no row locked. Tokens the server happened to issue again are not revoked, and neither are those of an
+	// authorization server that is no longer the connection's: a token is shown only to the server that issued it.
+	if oerr == nil && old.Issuer == c.Authorization.Issuer {
+		s.revoke(ctx, who, c, old, tok.Access, tok.Refresh)
+	}
+	return nil
 }
 
 // seal puts a token response into a grant, under the current key.
@@ -644,7 +654,7 @@ func (s *Service) Revoke(ctx context.Context, g grants.Grant) {
 	}
 }
 
-func (s *Service) revoke(ctx context.Context, who auth.Subject, c config.Connection, g grants.Grant) {
+func (s *Service) revoke(ctx context.Context, who auth.Subject, c config.Connection, g grants.Grant, keep ...string) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	d, err := s.Disc.Get(ctx, c)
@@ -671,6 +681,9 @@ func (s *Service) revoke(ctx context.Context, who auth.Subject, c config.Connect
 		if err != nil {
 			s.logf("revocation skipped", who, c, err)
 			continue
+		}
+		if slices.Contains(keep, string(plain)) {
+			continue // the same token is still the grant's
 		}
 		if err := s.F.Revoke(ctx, d.AS.RevocationEndpoint, ca, string(plain), t.hint); err != nil {
 			s.logf("revocation failed", who, c, err)
