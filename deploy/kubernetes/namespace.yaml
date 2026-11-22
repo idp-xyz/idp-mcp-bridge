@@ -1,0 +1,11 @@
+# idp-mcp-bridge has a namespace of its own: it is the component that holds the members' tokens for third-party services (B2) and
+# the one whose pods may open connections to the public internet, and nothing else lives in it, so that neither the egress
+# rule of networkpolicy.yaml nor the tokens can be inherited by anything else.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: idp-mcp-bridge
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    idp-mcp/mcp-upstream: "true"      # the idp-mcp gateway (and registry) may reach upstreams in namespaces carrying this label

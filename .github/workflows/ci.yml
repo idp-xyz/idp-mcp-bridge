@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: unit tests and the image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+      - name: Known vulnerabilities in the dependencies and the standard library (govulncheck)
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest && "$(go env GOPATH)/bin/govulncheck" ./...
+      - name: Format, vet, unit tests
+        run: make test
+      - name: Image builds
+        run: bash deploy/build.sh idp-mcp-bridge:ci
+      - name: Image vulnerabilities (trivy, HIGH and CRITICAL with a fix fail the build)
+        run: |
+          bash deploy/pull-image.sh ghcr.io/aquasecurity/trivy:0.76.2
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock ghcr.io/aquasecurity/trivy:0.76.2 image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 idp-mcp-bridge:ci
+
+  # The tests that prove the store, the split between the schema owner and the service role (the server cannot run DDL), and the
+  # refresh lock across replicas need a real PostgreSQL: make test-integration starts a throwaway one in a container of its own
+  # (the image is pulled by deploy/pull-image.sh with retries, on a free loopback port, and waited for) and removes it again.
+  # With IDP_TEST_PG_OWNER_URL set the tests fail, not skip, if the database cannot be reached.
+  integration:
+    name: tests over PostgreSQL
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+      - name: Tests over PostgreSQL (the store, the roles, the refresh lock, the OAuth flows)
+        run: make test-integration

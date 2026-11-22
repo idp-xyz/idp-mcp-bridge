@@ -1,0 +1,145 @@
+# The idp-mcp-bridge service (ADR-0001 D18). The members' grants (tokens, sealed) are in PostgreSQL (D24, D25), so it may run as
+# MORE THAN ONE replica: a grant is renewed by one pod at a time whichever pod it is (a row lock, D26), and an authorization
+# started on one pod is finished on another. What is still per pod: the rate-limit windows and the circuit breaker: with N replicas
+# a member can make up to N times the window's calls and each pod has its own breaker; the third party's own limits are the exact bound.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: idp-mcp-bridge
+  namespace: idp-mcp-bridge
+  labels:
+    app.kubernetes.io/component: bridge
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 1, maxUnavailable: 0}
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: bridge
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: bridge
+    spec:
+      automountServiceAccountToken: false         # it never talks to the Kubernetes API
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10680
+        runAsGroup: 10680
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: bridge
+          image: idp-mcp-bridge
+          ports:
+            - name: mcp
+              containerPort: 8680
+            - name: api
+              containerPort: 8681
+            - name: ops
+              containerPort: 9680
+          env:
+            - name: IDP_BRIDGE_LISTEN
+              value: "0.0.0.0:8680"
+            - name: IDP_BRIDGE_API_LISTEN
+              value: "0.0.0.0:8681"
+            - name: IDP_BRIDGE_METRICS
+              value: "0.0.0.0:9680"
+            - name: IDP_BRIDGE_PRIVATE_NETWORK      # the NetworkPolicy lets only the gateway, the registry and the Workspace reach it
+              value: "true"
+            - name: IDP_BRIDGE_CONFIG_FILE
+              value: /etc/idp/connections/connections.yaml
+            # The gateway's signature over the caller (ADR-0001 D2): every tools/call must carry it, made for the endpoint of
+            # ITS connection, which is IDP_BRIDGE_BASE_URL + /mcp/<id>, character for character the URL registered at the
+            # gateway (docs/RUNBOOK.md). There is no setting that turns the check off.
+            - name: IDP_BRIDGE_CALLER_KEYS_FILE
+              value: /etc/idp/gateway/caller.pub
+            - name: IDP_BRIDGE_BASE_URL
+              value: "http://idp-mcp-bridge.idp-mcp-bridge.svc.cluster.local:8680"
+            # OAuth (a connection with authorization mode oauth, docs/RUNBOOK.md 5): the database of the grants (as the app role; the
+            # owner's URL is the migration Job's alone) and the keys that seal the tokens are files of the operator's Secrets. Without an oauth connection they are not read.
+            - name: IDP_BRIDGE_DATABASE_URL_FILE
+              value: /etc/idp/database/service-url
+            - name: IDP_BRIDGE_ENCRYPTION_KEYS_FILE
+              value: /etc/idp/encryption/keys
+            # What is the operator's own (add with a patch or an edit; the service says which is missing and exits with 2):
+            # - name: IDP_BRIDGE_REDIRECT_URI           # the Workspace's callback page, https, the redirect address of every connection
+            #   value: https://workspace.example.com/oauth/callback
+            # - name: IDP_BRIDGE_OIDC_ISSUER            # Keycloak's realm: the Workspace's calls are verified against its keys
+            #   value: https://keycloak.example.com/realms/idp
+            # - name: IDP_BRIDGE_API_AUDIENCE           # what the Workspace exchanges the member's token for: this bridge's client
+            #   value: idp-mcp-bridge
+            # - name: IDP_BRIDGE_WORKSPACE_CLIENT      # the Workspace's token-exchange client (azp): no other client's token is accepted
+            #   value: idp-workspace
+            # A corporate egress proxy, if the network has one (docs/RUNBOOK.md 7): then the egress policy in networkpolicy.yaml
+            # must admit the proxy and nothing else, and the proxy must refuse non-public destinations itself.
+            # - name: IDP_BRIDGE_EGRESS_PROXY
+            #   value: http://proxy.corp.example.com:3128
+            # Never IDP_BRIDGE_TEST_ORIGINS: it exempts addresses from the address rules (ADR-0001 D6), and tests/deploy fails
+            # if it is in these files.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: ops
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: ops
+            periodSeconds: 20
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: "1", memory: 512Mi}       # an answer is held whole up to IDP_BRIDGE_MAX_RESULT_BYTES (1 MiB) per call in flight
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - {name: gateway-caller-keys, mountPath: /etc/idp/gateway, readOnly: true}
+            - {name: connections, mountPath: /etc/idp/connections, readOnly: true}
+            # secrets of preregistered clients (B2), one file each, named by `client.secretFile` in the connections file
+            - {name: client-secrets, mountPath: /etc/idp/secrets, readOnly: true}
+            - {name: database, mountPath: /etc/idp/database, readOnly: true}
+            - {name: encryption-keys, mountPath: /etc/idp/encryption, readOnly: true}
+      volumes:
+        - name: gateway-caller-keys
+          configMap:
+            name: idp-mcp-bridge-gateway-caller-keys  # created by the operator: the gateway's public key is not a secret
+        - name: connections
+          configMap:
+            name: idp-mcp-bridge-connections          # generated by kustomization.yaml from connections.yaml
+        - name: client-secrets
+          secret:
+            secretName: idp-mcp-bridge-client-secrets # created by the operator, when a connection has a preregistered client
+            optional: true
+        - name: database
+          secret:
+            secretName: idp-mcp-bridge-database       # created by the operator: service-url (a member of idp_bridge_app: no DDL) and ca.crt
+            optional: true                            # absent until a connection uses oauth: the missing URL is then the error to see
+        - name: encryption-keys
+          secret:
+            secretName: idp-mcp-bridge-encryption-keys   # created by the operator: keys (docs/RUNBOOK.md 5)
+            optional: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: idp-mcp-bridge
+  namespace: idp-mcp-bridge
+  labels:
+    app.kubernetes.io/component: bridge
+spec:
+  selector:
+    app.kubernetes.io/component: bridge
+  ports:
+    - name: mcp
+      port: 8680
+      targetPort: mcp
+    # the internal API of the Workspace (B2): a port of its own, so that the policy can admit the gateway to one and the
+    # Workspace to the other
+    - name: api
+      port: 8681
+      targetPort: api

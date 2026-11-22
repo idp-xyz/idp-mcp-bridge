@@ -1,0 +1,52 @@
+# Schema migrations of the bridge's database, run as the schema owner before a new image version is rolled out (the server runs no
+# DDL: it refuses to start on a schema that is not at the version it expects, so run this Job first and then roll the Deployment).
+# It creates the tables and the role idp_bridge_app with DML on them and nothing else; the login role the service runs as is made
+# once, by the operator, with `idp-mcp-bridge ensure-login` (docs/RUNBOOK.md 5.2). The owner's URL is in the Secret
+# idp-mcp-bridge-database-owner, which only this Job mounts: the Deployment never has it.
+# A Job's template cannot be changed after it was created: delete the old one (or wait for ttlSecondsAfterFinished) before
+# applying a new image.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: idp-mcp-bridge-migrate
+  namespace: idp-mcp-bridge
+  labels:
+    app.kubernetes.io/component: migrate
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: migrate
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10680
+        runAsGroup: 10680
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          image: idp-mcp-bridge
+          args: ["migrate"]                        # the image's entrypoint is /idp-mcp-bridge
+          env:
+            - name: IDP_BRIDGE_MIGRATION_DATABASE_URL_FILE
+              value: /etc/idp/database-owner/owner-url
+          resources:
+            requests: {cpu: 50m, memory: 32Mi}
+            limits: {cpu: 500m, memory: 128Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - {name: database-owner, mountPath: /etc/idp/database-owner, readOnly: true}
+      volumes:
+        - name: database-owner
+          secret:
+            secretName: idp-mcp-bridge-database-owner   # created by the operator: owner-url (and ca.crt if the URL names sslrootcert there)

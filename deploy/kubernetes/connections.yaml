@@ -1,0 +1,15 @@
+# The connections: the third-party MCP services this bridge fronts (docs/RUNBOOK.md 4; the format is documented in
+# internal/config/config.go and the README). NOTHING IS SHIPPED ENABLED: which third parties receive what the members' agents
+# send, and under whose terms, is the operator's decision (idp-mcp-bridge-oauth-plan.md; ADR-0001 D3), so the pod does not
+# start until this file lists at least one connection (it exits with status 2 and says why).
+#
+# Replace the line below with, for example:
+#
+# connections:
+#   - id: docs                          # the path /mcp/docs and the server name registered at the gateway
+#     title: Public docs                # what a member is told
+#     endpoint: https://mcp.docs.example.com/mcp
+#     authorization: {mode: none}       # the third party needs no token
+#
+# Never a test origin, never an address that is not a public https one: the bridge refuses them (ADR-0001 D6).
+connections: []

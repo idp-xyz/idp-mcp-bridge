@@ -1,0 +1,38 @@
+# idp-mcp-bridge on Kubernetes. NOT YET APPLIED TO A REAL CLUSTER: tests/deploy keeps these manifests consistent with each
+# other and with the code (names, ports, mounts, hardening, the egress rule against internal/addr).
+#
+# What the operator creates before applying (none of it is in this repository; docs/RUNBOOK.md 2):
+#   ConfigMap idp-mcp-bridge-gateway-caller-keys   key caller.pub: the idp-mcp gateway's public key (PEM, P-256)
+#   Secret    idp-mcp-bridge-client-secrets        one key per preregistered client's secret (optional: only when a
+#                                                  connection uses one)
+#   Secret    idp-mcp-bridge-database              service-url: postgres://idp_bridge_svc:...@host:5432/idp_bridge?sslmode=verify-full&sslrootcert=/etc/idp/database/ca.crt
+#                                                  and ca.crt: the service's login role, a member of idp_bridge_app (DML on three tables, no DDL).
+#                                                  Needed by oauth connections
+#   Secret    idp-mcp-bridge-database-owner        owner-url: the schema owner's URL, for the Job idp-mcp-bridge-migrate ONLY (docs/RUNBOOK.md 5.2)
+#   Secret    idp-mcp-bridge-encryption-keys       keys: the keys that seal the members' tokens, one <id>:<base64 of 32 bytes> a line,
+#                                                  the first seals (`openssl rand -base64 32`). Needed by oauth connections
+# and the connections: connections.yaml here lists none, and the pod does not start until it lists at least one
+# (docs/RUNBOOK.md 4).
+#
+# No commonLabels: it would rewrite the NetworkPolicy peers that select other namespaces' pods (the gateway, kube-dns).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - bridge.yaml
+  - migrate-job.yaml
+  - networkpolicy.yaml
+# the connections file, named by its content: a change replaces the pod, which reads the file once at start
+configMapGenerator:
+  - name: idp-mcp-bridge-connections
+    namespace: idp-mcp-bridge
+    files: [connections.yaml]
+labels:
+  - pairs:
+      app.kubernetes.io/name: idp-mcp-bridge
+      app.kubernetes.io/part-of: idp-telos
+    includeTemplates: true
+images:
+  - name: idp-mcp-bridge
+    newName: registry.example.com/idp/idp-mcp-bridge    # set to the image built by deploy/build.sh, pinned by digest
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
