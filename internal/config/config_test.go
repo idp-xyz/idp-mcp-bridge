@@ -197,3 +197,17 @@ func TestReviewerScopesAreOptionalCheckedLikeScopesAndForbiddenWithoutOAuth(t *t
 		t.Error("reviewerScopes for a connection that needs no token")
 	}
 }
+
+func TestScopesFromResourceIsAnOptInForOAuthConnectionsOnly(t *testing.T) {
+	cs, err := Parse([]byte(strings.Replace(good, "scopes: [repo, read:org]", "scopesFromResource: true", 1)), Options{})
+	if err != nil || !cs[0].Authorization.ScopesFromResource {
+		t.Fatalf("%v", err)
+	}
+	cs, _ = Parse([]byte(good), Options{})
+	if cs[0].Authorization.ScopesFromResource {
+		t.Fatal("on by default")
+	}
+	if _, err := Parse([]byte(`connections: [{id: a, title: A, endpoint: "https://a.example.com/mcp", authorization: {mode: none, scopesFromResource: true}}]`), Options{}); err == nil {
+		t.Error("scopesFromResource for a connection that needs no token")
+	}
+}

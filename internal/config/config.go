@@ -96,6 +96,10 @@ type Authorization struct {
 	// ReviewerScopes are what the connection's reviewer account is authorized for: the least that lets it list the tools
 	// (ADR-0001 D33). If empty, Scopes.
 	ReviewerScopes []string `yaml:"reviewerScopes"`
+	// ScopesFromResource is the explicit opt-in to ask, when Scopes is empty, for every scope the protected resource lists in its
+	// metadata (the MCP specification's SHOULD). Off by default: an operator who lists no scopes gets none requested, never everything
+	// the third party offers (ADR-0001 D37).
+	ScopesFromResource bool `yaml:"scopesFromResource"`
 }
 
 // Client is the bridge's identity at the authorization server.
@@ -254,7 +258,7 @@ func publicHTTPS(key, raw string, o Options, query bool) (addr.Address, error) {
 func (a *Authorization) validate(o Options) error {
 	switch a.Mode {
 	case AuthNone:
-		if a.Issuer != "" || a.Client != (Client{}) || len(a.Scopes) > 0 || len(a.ReviewerScopes) > 0 {
+		if a.Issuer != "" || a.Client != (Client{}) || len(a.Scopes) > 0 || len(a.ReviewerScopes) > 0 || a.ScopesFromResource {
 			return errors.New("mode none takes no issuer, client or scopes: they would be ignored, and an ignored line is a wrong belief")
 		}
 		return nil

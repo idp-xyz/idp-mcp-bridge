@@ -241,8 +241,9 @@ func (s *Service) start(ctx context.Context, who auth.Subject, id string, review
 	if reviewer && len(c.Authorization.ReviewerScopes) > 0 {
 		scope = strings.Join(c.Authorization.ReviewerScopes, " ") // the least that lets the account list the tools
 	}
-	if scope == "" {
-		scope = strings.Join(d.PRMScopes, " ") // the resource's own list, when the connection names none (the SDK's order)
+	if scope == "" && c.Authorization.ScopesFromResource {
+		// only on the operator's explicit opt-in: by default no scopes configured means none requested (ADR-0001 D37)
+		scope = strings.Join(d.PRMScopes, " ")
 	}
 	// after a step-up the member authorizes again for what was granted and what the third party now asks for
 	if g, err := s.Store.Get(ctx, owner(who, id)); !reviewer && err == nil && g.NeededScope != "" {
@@ -595,6 +596,18 @@ func (s *Service) InsufficientScope(ctx context.Context, who auth.Subject, id, s
 		return nil
 	}
 	err := s.Store.Locked(ctx, owner(who, id), func(g grants.Grant) (grants.Grant, grants.Action, error) {
+		// the third party's challenge can widen what the next authorization asks for (ADR-0001 D37): the names that are added are logged
+		if s.Log != nil {
+			var added []string
+			for _, n := range strings.Fields(scope) {
+				if validScopeName(n) && !slices.Contains(strings.Fields(g.Scope+" "+g.NeededScope), n) {
+					added = append(added, n)
+				}
+			}
+			if len(added) > 0 {
+				s.Log.Info("scope asked for by the third party's challenge", "connection", id, "tenant", who.Tenant, "added", strings.Join(added, " "))
+			}
+		}
 		g.NeededScope = union(union(g.Scope, g.NeededScope), scope)
 		g.ReauthReason = grants.ReasonInsufficientScope
 		return g, grants.Update, nil
@@ -747,3 +760,8 @@ func (s *Service) Sweep(ctx context.Context) (int, error) {
 
 var _ auth.TokenSource = (*Service)(nil)
 var _ api.Service = (*Service)(nil)
+
+// validScopeName is a scope token of RFC 6749 section 3.3 of a sane length: only such names are put in a log line.
+func validScopeName(n string) bool {
+	return n != "" && len(n) <= 128 && !strings.ContainsFunc(n, func(r rune) bool { return r < 0x21 || r > 0x7e || r == '"' || r == '\\' })
+}

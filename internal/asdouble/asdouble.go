@@ -69,11 +69,14 @@ type Server struct {
 	NoRefreshToken    bool
 	InvalidGrant      bool // refuse every refresh with invalid_grant
 	TokenError        int  // answer every token request with this HTTP status
-	TokenDelay        time.Duration
-	AuthEndpoint      string // what the metadata says the authorization endpoint is (default: this server's)
-	RedirectMetadata  string // "same": the metadata is served after a 307 to this server's other path; any address: a 307 there
-	RevokeStatus      int    // answer every revocation with this HTTP status
-	RequireResource   bool   // default true through New
+	// CodeError200 and RefreshError200 answer the code exchange, and a refresh, with HTTP 200 and this `error` in the body: what GitHub
+	// does (bad_verification_code, bad_refresh_token) instead of RFC 6749 section 5.2's 400.
+	CodeError200, RefreshError200 string
+	TokenDelay                    time.Duration
+	AuthEndpoint                  string // what the metadata says the authorization endpoint is (default: this server's)
+	RedirectMetadata              string // "same": the metadata is served after a 307 to this server's other path; any address: a 307 there
+	RevokeStatus                  int    // answer every revocation with this HTTP status
+	RequireResource               bool   // default true through New
 
 	clients map[string]string // preregistered: id -> secret
 	// Method is how the preregistered clients authenticate: the endpoint accepts only that one.
@@ -371,6 +374,10 @@ func (s *Server) token(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.RequireResource && r.Form.Get("resource") == "" {
 		jsonOut(w, 400, map[string]string{"error": "invalid_target"})
+		return
+	}
+	if e := map[string]string{"authorization_code": s.CodeError200, "refresh_token": s.RefreshError200}[r.Form.Get("grant_type")]; e != "" {
+		jsonOut(w, 200, map[string]string{"error": e, "error_description": "secret detail"})
 		return
 	}
 	var user, scope string

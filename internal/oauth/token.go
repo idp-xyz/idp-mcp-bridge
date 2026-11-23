@@ -54,7 +54,14 @@ const maxToken = 16 << 10
 // fixed set of the token endpoint's error codes the bridge distinguishes (RFC 6749 section 5.2); the error_description is
 // never read into anything
 var tokenErrors = map[string]bool{"invalid_request": true, "invalid_client": true, "invalid_grant": true, "unauthorized_client": true,
-	"unsupported_grant_type": true, "invalid_scope": true}
+	"unsupported_grant_type": true, "invalid_scope": true,
+	// GitHub's others, so that the log says what they were: none of them is a dead grant
+	"incorrect_client_credentials": true, "redirect_uri_mismatch": true, "unverified_user_email": true}
+
+// invalidGrantAliases are the codes of an authorization server that says "invalid_grant" in its own words: GitHub's, for a code that
+// is wrong or used (`bad_verification_code`) and a refresh token that is expired or revoked (`bad_refresh_token`). A known deviation
+// (ADR-0001 D36), kept to these two and explicit: a code that is not here is an error of the token endpoint, not a dead grant.
+var invalidGrantAliases = map[string]string{"bad_verification_code": "invalid_grant", "bad_refresh_token": "invalid_grant"}
 
 // TokenRequest posts a form to the token endpoint and validates the answer. A refusal by the server is an *Error whose Code
 // is CodeInvalidGrant or CodeTokenEndpoint (its Detail the RFC 6749 error code, from the fixed set); no answer, a server
@@ -66,23 +73,29 @@ func (f *Fetcher) TokenRequest(ctx context.Context, endpoint string, ca ClientAu
 	if err != nil {
 		return Tokens{}, err
 	}
-	if resp.Status != 200 {
-		if resp.Status >= 500 || resp.Status == 429 {
-			e := fail(CodeUnreachable, "the token endpoint answered HTTP %d", resp.Status)
-			e.Transient = true
-			return Tokens{}, e
-		}
-		var er struct {
-			Error string `json:"error"`
-		}
+	if resp.Status >= 500 || resp.Status == 429 {
+		e := fail(CodeUnreachable, "the token endpoint answered HTTP %d", resp.Status)
+		e.Transient = true
+		return Tokens{}, e
+	}
+	// An error response is one whose body has an `error`, whatever the status: RFC 6749 section 5.2 says 400, GitHub answers 200
+	// (ADR-0001 D36). Only the code is read, never error_description.
+	var er struct {
+		Error string `json:"error"`
+	}
+	if resp.Status != 200 || (json.Unmarshal(resp.Body, &er) == nil && er.Error != "") {
 		_ = json.Unmarshal(resp.Body, &er)
-		if !tokenErrors[er.Error] {
-			er.Error = "unknown"
+		code := er.Error
+		if mapped, ok := invalidGrantAliases[code]; ok {
+			code = mapped
 		}
-		if er.Error == "invalid_grant" {
+		if !tokenErrors[code] {
+			code = "unknown"
+		}
+		if code == "invalid_grant" {
 			return Tokens{}, fail(CodeInvalidGrant, "")
 		}
-		return Tokens{}, fail(CodeTokenEndpoint, "%s (HTTP %d)", er.Error, resp.Status)
+		return Tokens{}, fail(CodeTokenEndpoint, "%s (HTTP %d)", code, resp.Status)
 	}
 	var tr struct {
 		AccessToken  string          `json:"access_token"`

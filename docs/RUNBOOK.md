@@ -53,6 +53,7 @@ POST /api/v1/servers/{id}/approve         {"digest":"<看过的目录摘要>"}
 
 - `id`：小写字母、数字、连字符，至多 40 个字符；它是路径、网关里的服务名、成员授权的键，**登记之后不要改**（改了等于另一条连接）。
 - `endpoint`：公网 https 地址、443 端口、没有用户名密码、没有查询串、没有片段。内网地址、`http`、非 443 端口、数字写法古怪的 IP（`0x7f.1`）都被拒绝。
+- `scopes`、`reviewerScopes`：授权请求**恰好**要这些；没有配置就没有 `scope` 参数。要改成"资源元数据列出的全部"必须明确写 `scopesFromResource: true`（缺省 false，ADR D37）。
 - `authorization.mode`：`none`（第三方不要令牌；不许写 issuer、client、scopes）或 `oauth`（`issuer` 必填并钉死，`client` 是 `cimd`（带文档地址）或 `preregistered`（带 `id` 和 `secretFile`）；`dynamicRegistration: true` 只允许 cimd，是明确的选择，缺省关）。
 - `rateLimit`、`breaker`：缺省 60 秒窗口、每连接 300 次、每成员 60 次；连续 5 次失败后断开 30 秒。
 - 文件只在启动时读一次；kustomize 按内容给 ConfigMap 命名，改了会换 Pod。
@@ -166,6 +167,27 @@ IDP_BRIDGE_REVIEWER_TENANT=<运维的租户>        # 可选
 ### 5.7 `Mcp-Param-*` 头
 
 工具可以在输入 schema 里用 `x-mcp-header` 声明某些参数要镜像进 `Mcp-Param-<名>` 头（MCP 2026-07-28，SEP-2243）。桥按**最后一次列出的工具定义**和调用的参数算出这些头发给第三方（规则与上限见 ADR D34），**不复制网关请求里的任何头**。定义来自每次 `tools/list`；一个调用遇到目录里没有的工具（或目录超过 5 分钟）会先刷新一次（用评审账号；每条连接至多每 30 秒由调用引起一次，熔断器开着或超出连接限流时不刷新），仍然未知则**不带这些头照样发出**。工具有无效的 `x-mcp-header` 注解（类型是 number、名字不是 token、重名、不在 `properties` 一路可达的位置）则这个工具没有头。参数太长放不进头（值编码后超过 1024 字节、超过 16 个头、名字超过 128 字节）：调用被拒绝，模型读到哪里太长，第三方没有收到请求。
+
+### 5.8 GitHub 的托管 MCP 服务（`https://api.githubcopilot.com/mcp/readonly`）
+
+已用公开的元数据核对过：它说 2026-07-28，校验 `Mcp-Param-owner`、`Mcp-Param-repo`（ADR D34 就是为此），资源元数据的 `resource` 就是端点，授权服务器 `https://github.com/login/oauth`（`S256`、`authorization_response_iss_parameter_supported: true`，`scopes_supported: ["offline_access"]`）。连接文件写：
+
+```yaml
+  - id: github
+    title: GitHub
+    endpoint: https://api.githubcopilot.com/mcp/readonly     # 与它的资源元数据的 resource 逐字相同（结尾没有斜杠）
+    authorization:
+      mode: oauth
+      issuer: https://github.com/login/oauth
+      client: {mode: preregistered, id: <GitHub App 的 Client ID>, secretFile: /etc/idp/secrets/github}
+      scopes: []          # GitHub App 忽略 scope，权限在 App 的设置里；没有配置就不请求任何范围
+```
+
+- **客户端是预注册的 GitHub App，要开"Expire user authorization tokens"**（过期的用户令牌：访问令牌 8 小时、刷新令牌 6 个月，刷新时轮换）。GitHub 不支持客户端元数据文档（`client_id_metadata_document_supported` 没有）也没有动态注册，所以只能预注册；回调地址（Callback URL）填 `IDP_BRIDGE_REDIRECT_URI`；"Request user authorization (OAuth) during installation"按需。
+- **授权地址**：`scopes: []` 时**没有 `scope` 参数**（也没有 `offline_access`、`prompt`），只有 `response_type`、`client_id`、`redirect_uri`、`state`、`code_challenge`、`resource`（ADR D37：最小权限，不会向成员要资源列出的全部范围）。GitHub App 的权限在 App 的设置里。
+- **GitHub 没有撤销端点**（元数据里没有 `revocation_endpoint`）：成员断开、再授权、运维 `revoke` 都**只删除授权**，不向 GitHub 撤销；访问令牌在 8 小时内自己失效，刷新令牌随 App 的授权一起在 GitHub 那里由成员自己撤销（Settings → Applications）。
+- **GitHub 的令牌端点用 HTTP 200 回错误**（`error` 字段）。桥按 ADR D36 处理：`bad_refresh_token`、`bad_verification_code` 是 `invalid_grant`（授权被删除、成员被告知重新授权）；`incorrect_client_credentials`（客户端密钥错）、`redirect_uri_mismatch`（回调地址与 App 里的不同）、`unverified_user_email` 是令牌端点的错误：看日志里的码，授权不会被删除。
+- 评审账号（5.6）用一个专门的 GitHub 账号授权同一个 App；`mcp/readonly` 只读，是评审账号的合适端点。
 
 ## 6. 轮换
 
