@@ -71,6 +71,7 @@ POST /api/v1/servers/{id}/approve         {"digest":"<看过的目录摘要>"}
 | `IDP_BRIDGE_OIDC_ISSUER`、`IDP_BRIDGE_API_AUDIENCE`、`IDP_BRIDGE_WORKSPACE_CLIENT` | 验证 Workspace 对内部 API 的调用（ADR D28）：Keycloak 的 realm、令牌的受众（Workspace 换令牌时的 `audience`）、唯一被接受的 `azp`（Workspace 的令牌交换客户端）。`IDP_BRIDGE_OIDC_JWKS_URL`（缺省 `<issuer>/protocol/openid-connect/certs`）必须是 https；集群内只有 http 时要显式设 `IDP_BRIDGE_OIDC_ALLOW_HTTP=true`（启动日志警告：决定谁能调用的密钥经 http 取）。`IDP_BRIDGE_OIDC_CA_FILE` 给它加一个 CA。`IDP_BRIDGE_TENANT_CLAIM`（缺省 `tenant_id`）是租户声明 |
 
 | `IDP_BRIDGE_OFFBOARD_CLIENTS`、`IDP_BRIDGE_DIRECTORY`、`IDP_BRIDGE_RECONCILE_INTERVAL`、`IDP_BRIDGE_KEYCLOAK_*` | 成员离开（第 5.9 节）：允许调用"成员离开"接口的服务客户端（为空则接口不存在）、对账的目录（缺省 `none`）、对账间隔（缺省 15m，`0` 关闭）、开发测试用的 Keycloak 适配器的设置 |
+| `IDP_BRIDGE_DIAL_FAMILY` | `prefer-ipv4`（默认）、`dual`、`ipv4-only`、`ipv6-only`：检查过的地址按哪些地址族拨、哪个先拨（ADR-0001 D43）。默认 IPv4 先拨，IPv6 晚 250 ms 才开始；`dual` 是 RFC 8305 原样（解析器的第一个族先拨）；`ipv4-only` / `ipv6-only` 在拨号前丢掉另一个族，没有剩下的地址就按“无地址”报连接错误。不认识的值启动失败，启动时记一行日志。默认值 `prefer-ipv4` |
 | `IDP_BRIDGE_REVIEWER_ROLE`、`IDP_BRIDGE_REVIEWER_TENANT`、`IDP_BRIDGE_ROLES_CLAIM` | 谁可以授权评审账号（第 5.6 节）：令牌里 `roles` 声明（可改）含这个 realm 角色，设了租户则还要是这个租户。**没有缺省，不设就没有人能**；只设租户不设角色是配置错误 |
 
 **Keycloak 要做的**：一个客户端代表桥（它的 client id 就是 `IDP_BRIDGE_API_AUDIENCE`），允许 Workspace 的令牌交换客户端把成员的令牌换成以它为受众的令牌（idp-workspace 的 `auth: exchange` 配置里 `audience` 填它）；令牌要带租户声明；**要用评审账号的话，换来的令牌还要带 `roles` 声明**（桥的客户端要有 realm 角色的映射，平台的 realm 在用户的映射里有 `roles`，换出的令牌是否带上要在你的 Keycloak 里确认）。桥的出口策略要放到 Keycloak 的 JWKS（`networkpolicy.yaml` 的 `bridge-keycloak`，按你的 Keycloak 调整命名空间、标签与端口）。

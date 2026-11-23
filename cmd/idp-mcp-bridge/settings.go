@@ -13,6 +13,7 @@ import (
 
 	"idp-mcp-bridge/internal/app"
 	"idp-mcp-bridge/internal/config"
+	"idp-mcp-bridge/internal/egress"
 	"idp-mcp-bridge/internal/upstream"
 )
 
@@ -23,6 +24,7 @@ type settings struct {
 	callerKeys                 []byte
 	configFile                 string
 	testOrigins                map[string]bool
+	dialFamily                 egress.DialFamily
 	proxy                      *url.URL
 	maxResult, maxStream       int64
 	callTimeout                time.Duration
@@ -80,6 +82,9 @@ func loadSettings(getenv func(string) string) (*settings, error) {
 	var err error
 	if s.testOrigins, err = parseTestOrigins(getenv("IDP_BRIDGE_TEST_ORIGINS")); err != nil {
 		return nil, fmt.Errorf("invalid IDP_BRIDGE_TEST_ORIGINS: %w", err)
+	}
+	if s.dialFamily, err = egress.ParseDialFamily(getenv("IDP_BRIDGE_DIAL_FAMILY")); err != nil {
+		return nil, fmt.Errorf("invalid IDP_BRIDGE_DIAL_FAMILY: %w", err)
 	}
 	if s.configFile = getenv("IDP_BRIDGE_CONFIG_FILE"); s.configFile == "" {
 		return nil, errors.New("IDP_BRIDGE_CONFIG_FILE is not set: the file that lists the connections")

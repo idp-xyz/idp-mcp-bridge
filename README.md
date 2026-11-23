@@ -41,6 +41,8 @@ connections:
     authorization: {mode: none}      # no issuer, client or scopes: they would be ignored, so they are refused
 ```
 
+`IDP_BRIDGE_DIAL_FAMILY` (`prefer-ipv4` by default, `dual`, `ipv4-only`, `ipv6-only`) says which address families the checked dial uses and which goes first (ADR-0001 D43): IPv6 paths that connect and then stall cannot win the race by default, at the cost of 250 ms on an IPv6-only network.
+
 For acceptance only, `IDP_BRIDGE_TEST_ORIGINS` (exact `host:port` pairs) lets a connection's addresses be plain http on a private address, as idp-web's `IDP_WEB_TEST_ORIGINS` does; nothing else is exempted, and `tests/deploy` fails if a manifest sets it.
 
 ## What goes to the third party, exactly

@@ -41,6 +41,8 @@
 //	IDP_BRIDGE_API_AUDIENCE      what the Workspace's token is exchanged for (its `aud`)
 //	IDP_BRIDGE_WORKSPACE_CLIENT  the only client (`azp`) whose token is accepted; IDP_BRIDGE_TENANT_CLAIM names the tenant claim (tenant_id)
 //
+//	IDP_BRIDGE_DIAL_FAMILY       prefer-ipv4 (default), dual, ipv4-only or ipv6-only: which address families a connection to a
+//	                             third party dials and which goes first (ADR-0001 D43). An unknown value is a startup error
 //	IDP_BRIDGE_TEST_ORIGINS      for tests only: comma-separated host:port pairs that may be contacted although they are
 //	                             not public https addresses (ADR-0001 D6). Nothing else is exempted
 //
@@ -112,6 +114,7 @@ func main() {
 	if len(s.testOrigins) > 0 {
 		log.Warn("IDP_BRIDGE_TEST_ORIGINS exempts these origins from the address rules: for tests only", "origins", len(s.testOrigins))
 	}
+	log.Info("address families of connections to third parties", "dialFamily", string(s.dialFamily))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -119,7 +122,7 @@ func main() {
 	var os_ *oauthSettings
 	var store *grants.PG
 	var svc *oauth.Service
-	httpClient := egress.NewClient(egress.Options{TestOrigins: s.testOrigins, Proxy: s.proxy})
+	httpClient := egress.NewClient(egress.Options{TestOrigins: s.testOrigins, Proxy: s.proxy, DialFamily: s.dialFamily})
 	opts := app.Options{BaseURL: s.baseURL, CallerKeysPEM: s.callerKeys, Version: version, HTTP: httpClient,
 		MaxResult: s.maxResult, MaxStream: s.maxStream, CallTimeout: s.callTimeout}
 	met := bridge.NewMetrics()

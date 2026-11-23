@@ -1,6 +1,7 @@
 package main
 
 import (
+	"idp-mcp-bridge/internal/egress"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,7 +27,7 @@ func TestTheDefaultSettingsAreValidAndLoopbackOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	if s.listen != "127.0.0.1:8680" || s.apiListen != "127.0.0.1:8681" || s.metrics != "127.0.0.1:9680" || s.baseURL != "http://idp-mcp-bridge.idp-mcp-bridge.svc.cluster.local:8680" ||
-		s.maxResult != 1<<20 || s.maxStream != 4<<20 || s.callTimeout.Seconds() != 60 {
+		s.maxResult != 1<<20 || s.maxStream != 4<<20 || s.callTimeout.Seconds() != 60 || s.dialFamily != egress.PreferIPv4 {
 		t.Fatalf("%+v", s)
 	}
 }
@@ -49,6 +50,7 @@ func TestEachMissingOrInvalidSettingIsAConfigurationError(t *testing.T) {
 		{"two servers on one address", map[string]string{"IDP_BRIDGE_API_LISTEN": "127.0.0.1:8680"}, "three different"},
 		{"a wildcard test origin", map[string]string{"IDP_BRIDGE_TEST_ORIGINS": "*.example.com:1"}, "IDP_BRIDGE_TEST_ORIGINS"},
 		{"a test origin without a port", map[string]string{"IDP_BRIDGE_TEST_ORIGINS": "127.0.0.1"}, "IDP_BRIDGE_TEST_ORIGINS"},
+		{"an unknown dial family", map[string]string{"IDP_BRIDGE_DIAL_FAMILY": "ipv4"}, "IDP_BRIDGE_DIAL_FAMILY"},
 		{"a proxy with credentials", map[string]string{"IDP_BRIDGE_EGRESS_PROXY": "http://u:p@proxy:3128"}, "IDP_BRIDGE_EGRESS_PROXY"},
 		{"a proxy that is not http", map[string]string{"IDP_BRIDGE_EGRESS_PROXY": "socks5://proxy:1080"}, "IDP_BRIDGE_EGRESS_PROXY"},
 		{"a result limit of zero", map[string]string{"IDP_BRIDGE_MAX_RESULT_BYTES": "0"}, "IDP_BRIDGE_MAX_RESULT_BYTES"},

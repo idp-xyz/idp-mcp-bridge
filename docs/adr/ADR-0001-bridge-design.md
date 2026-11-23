@@ -60,6 +60,7 @@
 | D40 | **评审账号的授权人离开：保留、标记、告警，不撤销** | 授权人（`authorized_by`）离开（接口或对账）时，撤掉评审账号会让这个服务对所有成员不可用，所以保留；迁移 `0003_offboarding.sql` 给 `grants` 加 `authorizer_left`，`MarkAuthorizerLeft` 标记他授权的评审授权；日志 `the operator who authorized a reviewer account left: re-authorize it`（WARN）与计数器 `idp_bridge_reviewer_authorizer_left_total`；运维看到的列表里这条连接的 `reviewer` 是 `{"status":"connected","reason":"authorizer_left"}`（还能用，所以仍是 `connected`）；成员的列表没有这个键。由别的运维重新授权评审账号时新授权替换旧授权，标记随之清除。评审账号的令牌**从不**因此撤销。**对账也要找到他**：授权评审账号的运维可能自己没有任何成员授权，所以一轮对账除了有成员授权的人，还查评审授权里不同的 `authorized_by`（按存下来的样子解析：第一个 `/` 前是租户、后是成员；解析不了的跳过并记一条不带内容的日志；已经标记的不再查，告警只发一次）。这样的人：仍在或查不清 → 不动；已删除、已停用、换了租户 → **只**标记评审账号（`AuthorizerLeft`，审计 `event: authorizer_left`、告警、计数器）；同时有成员授权的人照旧整个离开（接口那条路径，里面已经标记），不重复计数。他们**与成员一样计入安全闸的分母与分子**（否则一次错误的"都离开了"会标记所有评审账号） |
 | D41 | **撤销没能确认：断开之后列表里如实说** | 成员断开时授权总是删除（D29），但如果向第三方的撤销失败，成员在 Workspace 里应当知道要去第三方那里自己撤销：表 `unconfirmed_revocations`（租户、成员、连接，时间），列表里这条连接是 `not_connected` 加 `reason: revocation_unconfirmed`；成员重新连接（`Finish`）时清除。只记成员自己的断开，不记离开的成员（没有人会看到）。适用于任何撤销机制，GitHub 的两个接口都失败时（D42）是它最常见的来源 |
 | D42 | **GitHub 的撤销：`revocation: github`，用 GitHub 自己的接口** | GitHub 的授权服务器没有 RFC 7009 的撤销端点，成员断开、再授权、离开之后，桥里的令牌删了，GitHub 那边的刷新令牌还能用约半年。连接配置加可选的 `authorization.revocation: github`（只对**预注册的客户端**有效：GitHub 的接口用应用的客户端 id 与密钥做 Basic 认证；写在 CIMD 客户端或不要令牌的连接上是配置错误）。断开、离开（接口与对账）、`revoke` 命令、评审账号的断开：`DELETE https://api.github.com/applications/{client_id}/grant`，Basic `client_id:client_secret`，JSON 正文 `{"access_token": "<这个授权当前的访问令牌>"}`，头 `Accept: application/vnd.github+json`、`X-GitHub-Api-Version: 2022-11-28`、`Content-Type: application/json`；走检查过地址的出口客户端，应答体有界，30 秒的时限。**204 是已撤销；404 与 422 当作已经没有了**（记一条日志，带状态码，不算失败）；**别的都是失败**，失败时再试 `DELETE /applications/{client_id}/token`（只撤这一个访问令牌）；两个都失败才算撤销失败（只记状态码，授权照样删除，D29；断开时记 D41）。**访问令牌已过期怎么办（本期的选择）**：如果存着的访问令牌已经过了到期时间，而授权有刷新令牌，就**先刷新一次**再出示新的令牌，理由是这个接口靠一个它认得的访问令牌指出是哪个授权，刷新是出示一个能被接受的令牌的唯一办法，代价是多一次刷新（结果马上被撤销）；没有刷新令牌，或刷新失败，就出示存着的旧令牌（GitHub 答 404 就是已经没有了）；没过期的不刷新。**再授权（D35）不用整个授权的接口**：同一个用户对同一个应用的授权 GitHub 那边只有一个，删了它新颁发的令牌也一起没了，所以被取代的访问令牌只走 `/token` 接口。**待核实**：GitHub 现行文档说 OAuth App 与 GitHub App 的所有者都能用 `/grant`，旧版文档说它不适用于 GitHub App 的用户令牌；本期按现行文档写，用替身测，**在下一次真实 GitHub 验证之前一直记为未核实**，实测要看：`/grant` 对 GitHub App 的过期用户令牌是否答 204，答 404/422 时刷新令牌是否确实也失效，`/token` 是否同时让刷新令牌失效。如果两个接口都不行，桥会如实在列表里写"撤销未确认"（D41），日志与计数器里是失败，运维提示成员到 GitHub 的 Settings → Applications 自己撤销 |
+| D43 | **已检查的地址按 Happy Eyeballs（RFC 8305 第 4、5 节）拨号：交错地址族，250 ms 错开，先连上的赢，其余取消、晚到的关闭** | 原来按解析器的顺序一个接一个地拨，第一个地址是不通的 IPv6 时，整个预算（或每个死地址的超时）花在它身上；真实的例子是 www.fedex.com 在没有 IPv6 路由的网络上。检查、不重新解析、代理都没有变。默认 IPv4 先拨，可用 `IDP_BRIDGE_DIAL_FAMILY` 改；细节与反向验证见本文件末尾的“D43”一节。 |
 
 ## 3. 对计划与相邻决策的反馈（B1、B2 中发现的）
 
@@ -374,3 +375,29 @@
 | B8R-5 | 已经标记的账号的授权人每轮都再查（存储） | `TestAnAuthorizerWhoAlsoHoldsMemberGrantsIsOffboardedOnceAndNotCountedTwice`, `TestTheStoreListsTheAuthorizersOfReviewerAccountsThatAreNotYetMarked` |
 
 （B8R 是 D40 的补充：对账找到没有成员授权的授权人；5 项全部失败。）
+
+## 反向验证与细节（D43，Happy Eyeballs）
+
+**为什么。**idp-mcp-bridge 的出口客户端对一个名字检查完所有地址后，原来按解析器给的顺序一个接一个地拨。在 IPv6 不通的网络里，第一个地址若是 IPv6，就要等它超时才轮到 IPv4。真实的例子是 www.fedex.com（解析结果先给 2600:1417:… 的 IPv6 地址）：在没有 IPv6 路由的网络上，IPv6 超时，IPv4 0.5 秒就答。
+
+**做法。**`dialRace(ctx, dial, ips, port)`（`internal/egress/dialrace.go`；三个仓库各抄一份，不共享代码，与地址规则一样）：先交错地址族（RFC 8305 第 4 节；族内保持解析器的顺序；从哪个族开始由下面的地址族设置定，默认 IPv4），第一次尝试立即开始；一次尝试在 `connectionAttemptDelay`（250 ms，具名常量）内既没连上也没失败，就在它继续的同时开始下一个；失败的立即开始下一个（第 5 节）；先连上的赢，其余尝试被取消，晚到的连接被关闭；全部失败返回最后一个错误，调用处的错误包装与审计原因不变。拨号函数是接缝，测试注入行为。超时：`net.Dialer` 的 5 秒保留为每次尝试的上限：整体期限是调用方的上下文，可能比 5 秒长，一次没有应答的尝试不该占着它；现在这 5 秒不再累加到每个死地址上。
+
+**没有变的。**地址检查（有一个地址不是公网就整体拒绝，发生在任何拨号之前）、不重新解析（只拨检查过的 IP，不拨主机名）、配置了代理时只拨代理。没有做的：AAAA 与 A 并行解析（RFC 8305 第 3 节），解析仍是一次。
+
+**反向验证（2026-11-24）。**每项去掉后，下列测试失败，恢复后全过：
+
+| 去掉 | 失败的测试 |
+|---|---|
+| 不错开 | TestHangingFirst… |
+| 不取消落败的尝试 | TestHangingFirst…、TestClientReachesTheSecondAddress… |
+| 不关闭晚到的连接 | TestAConnectionThatCompletesAfterTheRaceIsClosed |
+| 不交错地址族 | TestInterleaving… |
+| 在已检查的地址前多拨一个未检查的地址 | TestClientReachesTheSecondAddress…、TestEveryAnswerOfANameMustBePublic…、TestATestOriginIsExempt… |
+
+**地址族设置：`IDP_BRIDGE_DIAL_FAMILY`（后补，同日）。**真实检查发现一种连接竞速看不见的情况：从没有可用 IPv6 的网络读 FedEx（Akamai）香港的页面，IPv6 的 TCP 有时在 250 ms 内就连上，随后数据不通（curl -6：状态 200 之后什么都没有，直到超时；curl -4：0.24 s）。解析器按 RFC 6724 把 IPv6 排在前面，于是 IPv6 先开始、先连上、赢了，然后卡住；连接竞速只比谁先连上。所以加一个设置，取值 `prefer-ipv4`（**默认**）、`dual`（RFC 8305 原样：解析器的第一个族先拨）、`ipv4-only`、`ipv6-only`；`prefer-ipv4` 是同一个竞速，只是交错从 IPv4 开始；`ipv4-only` / `ipv6-only` 在竞速之前丢掉另一个族，一个都不剩时报与“无地址”相同的连接错误。未知值是启动错误，启动时记一行日志。**为什么默认 `prefer-ipv4`：**大陆和许多企业网络的 IPv6 连得上却会卡住，而 IPv4 几乎在所有地方都通；代价只在纯 IPv6 的网络：IPv6 的尝试晚 250 ms 才开始（这样的网络用 `dual`）。检查、不重新解析、代理都没有变。
+
+| 去掉（地址族设置） | 失败的测试 |
+|---|---|
+| `prefer-ipv4` 也从第一个地址的族开始（等于 `dual`） | `TestPreferIPv4NeverLetsAStallingIPv6PathWin`、`TestEachFamilySettingGivesItsOrder`（客户端一侧的 `TestClientUsesIPv4WhenIPv6ConnectsAndThenStalls` 在这个对照下会一直等到测试超时） |
+| `ipv4-only` 不丢掉 IPv6 | `TestEachFamilySettingGivesItsOrder`、`TestAFamilyWithNoAddressIsAnErrorWithoutDialing` |
+| 去掉验证 | `TestDialFamilySettingIsValidated`、`loadSettings` 的“未知值”用例；未知值是配置错误（退出码 2），启动时记一行日志 |

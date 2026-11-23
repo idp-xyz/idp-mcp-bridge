@@ -42,6 +42,9 @@ type Options struct {
 	// (IDP_BRIDGE_TEST_ORIGINS). Nothing else is exempted: not another port on the host, not another host.
 	TestOrigins map[string]bool
 	Resolver    Resolver // default: the system resolver
+	// DialFamily is which address families a checked dial uses and which goes first (IDP_BRIDGE_DIAL_FAMILY, ADR-0001
+	// D43). Default: prefer-ipv4.
+	DialFamily DialFamily
 	// Dial makes the connection to an address that has been checked; default net.Dialer. A seam for tests.
 	Dial func(ctx context.Context, network, address string) (net.Conn, error)
 	// Proxy is the corporate egress proxy, if the operator's network has one (IDP_BRIDGE_EGRESS_PROXY). With a proxy the
@@ -146,13 +149,9 @@ func (d *dialer) checked(ctx context.Context, _, address string) (net.Conn, erro
 			}
 		}
 	}
-	var last error
-	for _, ip := range ips {
-		c, err := d.o.Dial(ctx, "tcp", netip.AddrPortFrom(ip.Unmap(), uint16(port)).String())
-		if err == nil {
-			return c, nil
-		}
-		last = err
+	c, err := dialRace(ctx, d.o.Dial, d.o.DialFamily, ips, port)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrConnect, err)
 	}
-	return nil, fmt.Errorf("%w: %v", ErrConnect, last)
+	return c, nil
 }
