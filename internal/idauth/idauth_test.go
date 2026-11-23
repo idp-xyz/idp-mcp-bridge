@@ -231,3 +231,53 @@ func TestTheReviewerRoleAndTenantMakeAReviewerAndNothingElseDoes(t *testing.T) {
 		t.Fatal("the roles claim")
 	}
 }
+
+// ADR-0001 D38: the token of a service that tells the bridge a member left.
+func TestAServiceTokenIsAClientCredentialsTokenOfAClientOnTheAllowListAndNothingElseIs(t *testing.T) {
+	r := newRealm(t)
+	v := r.verifier()
+	v.ServiceClients = []string{"lifecycle"}
+	svc := func(mod func(jwt.MapClaims)) string {
+		return sign(t, jwt.SigningMethodRS256, r.rsa, "rsa1", jwt.MapClaims{"iss": issuer, "aud": []string{audience}, "azp": "lifecycle", "sub": "service-account-lifecycle",
+			"exp": time.Now().Add(time.Minute).Unix(), "iat": time.Now().Unix()})
+	}
+	if azp, err := v.AuthenticateService(context.Background(), svc(nil)); err != nil || azp != "lifecycle" {
+		t.Fatalf("%q %v", azp, err)
+	}
+	// valid tokens that are not a service's: forbidden
+	forbidden := map[string]string{
+		"a member's token (the Workspace's client)": sign(t, jwt.SigningMethodRS256, r.rsa, "rsa1", claims(nil)),
+		"another client":                   sign(t, jwt.SigningMethodRS256, r.rsa, "rsa1", claims(func(c jwt.MapClaims) { c["azp"] = "someone"; delete(c, "tenant_id") })),
+		"the listed client with a session": sign(t, jwt.SigningMethodRS256, r.rsa, "rsa1", claims(func(c jwt.MapClaims) { c["azp"] = "lifecycle"; c["sid"] = "s1" })),
+		"the listed client as a delegate":  sign(t, jwt.SigningMethodRS256, r.rsa, "rsa1", claims(func(c jwt.MapClaims) { c["azp"] = "lifecycle"; c["act"] = map[string]string{"sub": "x"} })),
+		"no azp":                           sign(t, jwt.SigningMethodRS256, r.rsa, "rsa1", claims(func(c jwt.MapClaims) { delete(c, "azp") })),
+	}
+	for name, tok := range forbidden {
+		if _, err := v.AuthenticateService(context.Background(), tok); !errors.Is(err, api.ErrForbidden) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	// tokens that are not valid: unauthenticated
+	for name, mod := range map[string]func(jwt.MapClaims){"another issuer": func(c jwt.MapClaims) { c["iss"] = "x" }, "another audience": func(c jwt.MapClaims) { c["aud"] = []string{"idp-host"} },
+		"expired": func(c jwt.MapClaims) { c["exp"] = time.Now().Add(-time.Hour).Unix() }} {
+		c := jwt.MapClaims{"iss": issuer, "aud": []string{audience}, "azp": "lifecycle", "exp": time.Now().Add(time.Minute).Unix()}
+		mod(c)
+		if _, err := v.AuthenticateService(context.Background(), sign(t, jwt.SigningMethodRS256, r.rsa, "rsa1", c)); !errors.Is(err, api.ErrUnauthenticated) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	other, _ := rsa.GenerateKey(rand.Reader, 2048)
+	if _, err := v.AuthenticateService(context.Background(), sign(t, jwt.SigningMethodRS256, other, "rsa1", jwt.MapClaims{"iss": issuer, "aud": []string{audience}, "azp": "lifecycle", "exp": time.Now().Add(time.Minute).Unix()})); !errors.Is(err, api.ErrUnauthenticated) {
+		t.Errorf("signed by another key: %v", err)
+	}
+	// no list: no service
+	v.ServiceClients = nil
+	if _, err := v.AuthenticateService(context.Background(), svc(nil)); !errors.Is(err, api.ErrForbidden) {
+		t.Errorf("an empty allow-list: %v", err)
+	}
+	// and the member's own authentication does not accept the service's token as a member
+	v.ServiceClients = []string{"lifecycle"}
+	if _, err := v.Authenticate(context.Background(), svc(nil)); err == nil {
+		t.Error("a service token authenticated as a member")
+	}
+}

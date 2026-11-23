@@ -33,6 +33,11 @@
 //	IDP_BRIDGE_OIDC_ALLOW_HTTP   =true; IDP_BRIDGE_OIDC_CA_FILE adds a CA for it
 //	IDP_BRIDGE_REVIEWER_ROLE     the realm role (in the `roles` claim, IDP_BRIDGE_ROLES_CLAIM) of the operators who may authorize reviewer
 //	                             accounts; IDP_BRIDGE_REVIEWER_TENANT narrows it to one tenant. No default: unset, no one can
+//	IDP_BRIDGE_OFFBOARD_CLIENTS  comma-separated OIDC clients (azp) whose client-credentials tokens may call POST /internal/v1/members/offboard
+//	                             (a member has left); empty: the route is disabled
+//	IDP_BRIDGE_DIRECTORY         none (default) or keycloak-dev (for development and tests only): where the reconciliation asks whether a member
+//	                             is still one; IDP_BRIDGE_RECONCILE_INTERVAL (default 15m, 0 = off); the adapter's IDP_BRIDGE_KEYCLOAK_URL,
+//	                             _REALM, _CLIENT_ID, _CLIENT_SECRET_FILE, _TENANT_ATTRIBUTE (tenant_id)
 //	IDP_BRIDGE_API_AUDIENCE      what the Workspace's token is exchanged for (its `aud`)
 //	IDP_BRIDGE_WORKSPACE_CLIENT  the only client (`azp`) whose token is accepted; IDP_BRIDGE_TENANT_CLAIM names the tenant claim (tenant_id)
 //
@@ -64,7 +69,9 @@ import (
 	"idp-mcp-bridge/internal/bridge"
 	"idp-mcp-bridge/internal/egress"
 	"idp-mcp-bridge/internal/grants"
+	"idp-mcp-bridge/internal/idauth"
 	"idp-mcp-bridge/internal/oauth"
+	"idp-mcp-bridge/internal/reconcile"
 
 	// The image is FROM scratch and holds no CA certificates. This import registers Mozilla's roots as the fallback of
 	// crypto/x509, which Go uses when the system has none (ADR-0001 D18).
@@ -120,7 +127,7 @@ func main() {
 	var reviewer auth.ReviewerSource = auth.NoReviewer{} // B1's: listings go out without a token
 	var apiSvc api.Service = api.Unimplemented{}
 	var apiAuth api.Authenticator = api.Unimplemented{}
-	if hasOAuth(conns) || sub == "revoke" || sub == "reseal" {
+	if hasOAuth(conns) || sub == "revoke" || sub == "reseal" || sub == "reconcile" {
 		if os_, err = loadOAuthSettings(os.Getenv, s.testOrigins); err != nil {
 			fatal(err)
 		}
@@ -129,10 +136,26 @@ func main() {
 		}
 		defer store.Close()
 		svc = os_.service(conns, store, httpClient, app.Prober(conns, httpClient, opts), s.testOrigins, log)
+		svc.Counters = met
+	}
+	var reconciler *reconcile.Reconciler
+	if os_ != nil {
+		dir, err := os_.buildDirectory(log)
+		if err != nil {
+			fatal(err)
+		}
+		if dir != nil {
+			reconciler = &reconcile.Reconciler{Store: store, Dir: dir, Off: svc, Log: log, Counters: met, Interval: os_.reconcileInterval}
+		}
 	}
 	switch sub {
 	case "revoke":
 		if err := revokeCmd(ctx, os.Args[2:], svc, os.Stdout); err != nil {
+			fatal(err)
+		}
+		return
+	case "reconcile":
+		if err := reconcileCmd(ctx, os.Args[2:], reconciler, os.Stdout); err != nil {
 			fatal(err)
 		}
 		return
@@ -143,7 +166,7 @@ func main() {
 		return
 	case "":
 	default:
-		fatal("unknown command", sub, "(check-config, migrate, ensure-login, revoke, reseal; no argument runs the server)")
+		fatal("unknown command", sub, "(check-config, migrate, ensure-login, revoke, reseal, reconcile; no argument runs the server)")
 	}
 	if svc != nil {
 		tokens, apiSvc, reviewer = svc, svc, oauth.ReviewerSource{S: svc}
@@ -174,7 +197,17 @@ func main() {
 	log.Info("configured", "connections", len(conns), "oauth", svc != nil, "proxy", s.proxy != nil, "maxResultBytes", s.maxResult, "maxStreamBytes", s.maxStream)
 
 	mcpSrv := &http.Server{Addr: s.listen, Handler: handler, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: s.callTimeout + 30*time.Second}
-	apiSrv := &http.Server{Addr: s.apiListen, Handler: api.New(apiAuth, apiSvc), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 60 * time.Second}
+	apiHandler := api.New(apiAuth, apiSvc)
+	if svc != nil && len(os_.offboardClients) > 0 {
+		v, _ := apiAuth.(*idauth.Verifier)
+		apiHandler.EnableOffboarding(v, oauth.OffboardAPI{S: svc})
+		log.Info("the member-left route is enabled", "clients", len(os_.offboardClients))
+	}
+	if reconciler != nil && reconciler.Interval > 0 {
+		go reconciler.Run(ctx)
+		log.Info("members are reconciled against the directory", "directory", os_.directory, "interval", reconciler.Interval.String())
+	}
+	apiSrv := &http.Server{Addr: s.apiListen, Handler: apiHandler, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 60 * time.Second}
 	ops := http.NewServeMux()
 	ops.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { fmt.Fprintln(w, "ok") })
 	ops.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {

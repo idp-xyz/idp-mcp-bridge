@@ -33,6 +33,9 @@ import (
 // ErrNotImplemented is what B1 answers: 501.
 var ErrNotImplemented = errors.New("not implemented: this is B2")
 
+// ErrForbidden: the token is good and its owner may not do this: 403.
+var ErrForbidden = errors.New("forbidden")
+
 // ErrUnauthenticated: the token is missing or not good: 401.
 var ErrUnauthenticated = errors.New("not authenticated")
 
@@ -140,11 +143,64 @@ func (Unimplemented) Authenticate(context.Context, string) (auth.Subject, error)
 	return auth.Subject{}, ErrNotImplemented
 }
 
+// ServiceAuthenticator verifies the token of a service that calls the "member left" route and returns its azp.
+type ServiceAuthenticator interface {
+	AuthenticateService(ctx context.Context, bearer string) (azp string, err error)
+}
+
+// OffboardRequest is what the route asks for; Offboarder does it (oauth.Service).
+type OffboardRequest struct {
+	Tenant, Member, Reason, Caller string
+}
+
+// OffboardResult is the route's answer: counts, nothing else.
+type OffboardResult struct {
+	GrantsRemoved     int `json:"grants_removed"`
+	RevocationsFailed int `json:"revocations_failed"`
+	ReviewerMarked    int `json:"reviewer_grants_marked"`
+}
+
+// Offboarder removes what the bridge holds for a member who left.
+type Offboarder interface {
+	Offboard(ctx context.Context, req OffboardRequest) (OffboardResult, error)
+}
+
 // Handler serves the API.
 type Handler struct {
 	Auth Authenticator
 	Svc  Service
 	mux  *http.ServeMux
+}
+
+// reasons the route accepts (ADR-0001 D38).
+var offboardReasons = map[string]bool{"user_deleted": true, "user_disabled": true, "tenant_changed": true, "operator": true, "other": true}
+
+// EnableOffboarding adds `POST /internal/v1/members/offboard` (ADR-0001 D38): a service, authenticated with an OIDC client-credentials
+// token whose azp the operator allowed, tells the bridge that a member left: {"tenant","member","reason"}. A member's token is never
+// enough. Without it the route does not exist (404).
+func (h *Handler) EnableOffboarding(a ServiceAuthenticator, o Offboarder) {
+	h.mux.HandleFunc("POST /internal/v1/members/offboard", func(w http.ResponseWriter, r *http.Request) {
+		bearer, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if !ok || strings.TrimSpace(bearer) == "" {
+			unauthenticated(w)
+			return
+		}
+		azp, err := a.AuthenticateService(r.Context(), strings.TrimSpace(bearer))
+		if err != nil {
+			h.answer(w, err, nil)
+			return
+		}
+		var req OffboardRequest
+		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10))
+		dec.DisallowUnknownFields()
+		if dec.Decode(&req) != nil || req.Tenant == "" || req.Member == "" || len(req.Tenant) > 256 || len(req.Member) > 256 || !offboardReasons[req.Reason] {
+			reply(w, http.StatusBadRequest, map[string]string{"error": "invalid_request"})
+			return
+		}
+		req.Caller = azp
+		res, err := o.Offboard(r.Context(), req)
+		h.answer(w, err, func() { reply(w, http.StatusOK, res) })
+	})
 }
 
 // New builds the handler.
@@ -235,6 +291,8 @@ func (h *Handler) answer(w http.ResponseWriter, err error, ok func()) {
 		}
 	case errors.Is(err, ErrUnauthenticated):
 		unauthenticated(w)
+	case errors.Is(err, ErrForbidden):
+		reply(w, http.StatusForbidden, map[string]string{"error": "forbidden"})
 	case errors.Is(err, ErrNotImplemented):
 		reply(w, http.StatusNotImplemented, map[string]string{"error": "not_implemented"})
 	case errors.Is(err, errBadRequest):

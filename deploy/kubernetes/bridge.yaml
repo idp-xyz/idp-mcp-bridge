@@ -77,6 +77,15 @@ spec:
             # and unset means no one can.
             # - name: IDP_BRIDGE_REVIEWER_ROLE
             #   value: idp-reviewer
+            # Members who leave (docs/RUNBOOK.md 5.9): the service clients (azp) whose client-credentials tokens may call
+            # POST /internal/v1/members/offboard; empty or unset, the route does not exist. The reconciliation needs a directory
+            # adapter; keycloak-dev is for development and tests only (its IDP_BRIDGE_KEYCLOAK_* settings are in the RUNBOOK).
+            # - name: IDP_BRIDGE_OFFBOARD_CLIENTS
+            #   value: idp-lifecycle
+            # - name: IDP_BRIDGE_DIRECTORY
+            #   value: keycloak-dev
+            # - name: IDP_BRIDGE_RECONCILE_INTERVAL
+            #   value: 15m
             # A corporate egress proxy, if the network has one (docs/RUNBOOK.md 7): then the egress policy in networkpolicy.yaml
             # must admit the proxy and nothing else, and the proxy must refuse non-public destinations itself.
             # - name: IDP_BRIDGE_EGRESS_PROXY

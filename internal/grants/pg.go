@@ -163,14 +163,14 @@ func (s *PG) ctx(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(ctx, s.timeout)
 }
 
-const grantCols = `tenant, member, connection, sealed_access, sealed_refresh, access_expires, issuer, scope, needed_scope, reauth_reason, created_at, refreshed_at, reviewer, authorized_by`
+const grantCols = `tenant, member, connection, sealed_access, sealed_refresh, access_expires, issuer, scope, needed_scope, reauth_reason, created_at, refreshed_at, reviewer, authorized_by, authorizer_left`
 
 type scanner interface{ Scan(...any) error }
 
 func scanGrant(r scanner) (Grant, error) {
 	var g Grant
 	var exp *time.Time
-	err := r.Scan(&g.Tenant, &g.Member, &g.Connection, &g.SealedAccess, &g.SealedRefresh, &exp, &g.Issuer, &g.Scope, &g.NeededScope, &g.ReauthReason, &g.CreatedAt, &g.RefreshedAt, &g.Reviewer, &g.AuthorizedBy)
+	err := r.Scan(&g.Tenant, &g.Member, &g.Connection, &g.SealedAccess, &g.SealedRefresh, &exp, &g.Issuer, &g.Scope, &g.NeededScope, &g.ReauthReason, &g.CreatedAt, &g.RefreshedAt, &g.Reviewer, &g.AuthorizedBy, &g.AuthorizerLeft)
 	if exp != nil {
 		g.AccessExpires = *exp
 	}
@@ -201,13 +201,13 @@ func (s *PG) Get(ctx context.Context, k Key) (Grant, error) {
 	return g, err
 }
 
-const upsert = `INSERT INTO grants (` + grantCols + `) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+const upsert = `INSERT INTO grants (` + grantCols + `) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
 ON CONFLICT (tenant, member, connection, reviewer) DO UPDATE SET sealed_access=EXCLUDED.sealed_access, sealed_refresh=EXCLUDED.sealed_refresh,
  access_expires=EXCLUDED.access_expires, issuer=EXCLUDED.issuer, scope=EXCLUDED.scope, needed_scope=EXCLUDED.needed_scope, reauth_reason=EXCLUDED.reauth_reason,
- created_at=EXCLUDED.created_at, refreshed_at=EXCLUDED.refreshed_at, authorized_by=EXCLUDED.authorized_by`
+ created_at=EXCLUDED.created_at, refreshed_at=EXCLUDED.refreshed_at, authorized_by=EXCLUDED.authorized_by, authorizer_left=EXCLUDED.authorizer_left`
 
 func putArgs(g Grant) []any {
-	return []any{g.Tenant, g.Member, g.Connection, g.SealedAccess, nullBytes(g.SealedRefresh), nullTime(g.AccessExpires), g.Issuer, g.Scope, g.NeededScope, g.ReauthReason, g.CreatedAt, g.RefreshedAt, g.Reviewer, g.AuthorizedBy}
+	return []any{g.Tenant, g.Member, g.Connection, g.SealedAccess, nullBytes(g.SealedRefresh), nullTime(g.AccessExpires), g.Issuer, g.Scope, g.NeededScope, g.ReauthReason, g.CreatedAt, g.RefreshedAt, g.Reviewer, g.AuthorizedBy, g.AuthorizerLeft}
 }
 
 func (s *PG) Put(ctx context.Context, g Grant) error {
@@ -430,4 +430,108 @@ func validIdent(s string) bool {
 		}
 	}
 	return true
+}
+
+func (s *PG) DeleteMemberStates(ctx context.Context, tenant, member string) (int, error) {
+	ctx, cancel := s.ctx(ctx)
+	defer cancel()
+	t, err := s.pool.Exec(ctx, `DELETE FROM pending_states WHERE tenant=$1 AND member=$2`, tenant, member)
+	return int(t.RowsAffected()), err
+}
+
+func (s *PG) Members(ctx context.Context) ([][2]string, error) {
+	ctx, cancel := s.ctx(ctx)
+	defer cancel()
+	rows, err := s.pool.Query(ctx, `SELECT DISTINCT tenant, member FROM grants WHERE NOT reviewer ORDER BY tenant, member`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out [][2]string
+	for rows.Next() {
+		var p [2]string
+		if err := rows.Scan(&p[0], &p[1]); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+func (s *PG) Authorizers(ctx context.Context) ([]string, error) {
+	ctx, cancel := s.ctx(ctx)
+	defer cancel()
+	rows, err := s.pool.Query(ctx, `SELECT DISTINCT authorized_by FROM grants WHERE reviewer AND NOT authorizer_left AND authorized_by <> '' ORDER BY authorized_by`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var a string
+		if err := rows.Scan(&a); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+func (s *PG) MarkAuthorizerLeft(ctx context.Context, authorizedBy string) (int, error) {
+	ctx, cancel := s.ctx(ctx)
+	defer cancel()
+	t, err := s.pool.Exec(ctx, `UPDATE grants SET authorizer_left = true WHERE reviewer AND authorized_by = $1`, authorizedBy)
+	return int(t.RowsAffected()), err
+}
+
+func (s *PG) PutUnconfirmed(ctx context.Context, k Key, at time.Time) error {
+	ctx, cancel := s.ctx(ctx)
+	defer cancel()
+	_, err := s.pool.Exec(ctx, `INSERT INTO unconfirmed_revocations (tenant, member, connection, at) VALUES ($1,$2,$3,$4)
+ON CONFLICT (tenant, member, connection) DO UPDATE SET at = EXCLUDED.at`, k.Tenant, k.Member, k.Connection, at)
+	return err
+}
+
+func (s *PG) ClearUnconfirmed(ctx context.Context, k Key) error {
+	ctx, cancel := s.ctx(ctx)
+	defer cancel()
+	_, err := s.pool.Exec(ctx, `DELETE FROM unconfirmed_revocations WHERE tenant=$1 AND member=$2 AND connection=$3`, k.Tenant, k.Member, k.Connection)
+	return err
+}
+
+func (s *PG) Unconfirmed(ctx context.Context, tenant, member string) ([]string, error) {
+	ctx, cancel := s.ctx(ctx)
+	defer cancel()
+	rows, err := s.pool.Query(ctx, `SELECT connection FROM unconfirmed_revocations WHERE tenant=$1 AND member=$2 ORDER BY connection`, tenant, member)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var c string
+		if err := rows.Scan(&c); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// TryLock takes a session-level advisory lock on a connection of its own, which it keeps until release: the lock is the
+// database's, so it holds across replicas, and it goes if the replica dies (the connection closes).
+func (s *PG) TryLock(ctx context.Context, id int64) (func(), bool, error) {
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	var got bool
+	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, id).Scan(&got); err != nil || !got {
+		conn.Release()
+		return nil, false, err
+	}
+	return func() {
+		_, _ = conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, id)
+		conn.Release()
+	}, true, nil
 }

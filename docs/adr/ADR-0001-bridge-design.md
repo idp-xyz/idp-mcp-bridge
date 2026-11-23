@@ -2,7 +2,7 @@
 
 | 项 | 内容 |
 |---|---|
-| 状态 | 已接受（2026-11-22，随任务 B1；外联桥计划第 5 节）。D25 在 B2 评审后改为所有者与应用角色分开。D33、D34 随任务 B3（评审账号、`Mcp-Param-*` 头）；D36、D37 随 GitHub 的验证（令牌端点用 200 回错误；最小权限的范围）；D35 在平台验收之后（再授权时撤销被取代的令牌）。D21 到 D32 随任务 B2（OAuth、授权库、Workspace 的内部 API）；B3（评审账号）在 D33 实现，D13 的 `ReviewerSource` 是它的接入点。D15（存储接口）与 D16（内部 API）在 B2 里实现，细节以 D24 到 D30 为准 |
+| 状态 | 已接受（2026-11-22，随任务 B1；外联桥计划第 5 节）。D25 在 B2 评审后改为所有者与应用角色分开。D33、D34 随任务 B3（评审账号、`Mcp-Param-*` 头）；D38 到 D42 随成员离开的撤销（F1、F2，计划 `idp-mcp-bridge-offboarding-plan.md`）；D36、D37 随 GitHub 的验证（令牌端点用 200 回错误；最小权限的范围）；D35 在平台验收之后（再授权时撤销被取代的令牌）。D21 到 D32 随任务 B2（OAuth、授权库、Workspace 的内部 API）；B3（评审账号）在 D33 实现，D13 的 `ReviewerSource` 是它的接入点。D15（存储接口）与 D16（内部 API）在 B2 里实现，细节以 D24 到 D30 为准 |
 | 范围 | `idp-mcp-bridge` 的技术栈、连接配置、对网关的 MCP 端点与调用者校验、对第三方的 MCP 客户端（发什么、收什么）、地址规则与出口、限流与熔断、"需要授权"的答复、为 B2 留的接口、审计与指标、部署 |
 | 依据 | B2：RFC 6749、6750、7009、7591、7636、8414、8707、9207、9728，OpenID Connect Discovery 1.0，OAuth Client ID Metadata Document（草案），MCP 2026-07-28 授权部分（规范页本机取不到，以官方 Python SDK 2026-10-13 的客户端为参照读过，不抄：`idp-mcp/build/conformance-deps/python-sdk/src/mcp/client/auth/`）；平台的 `docs/adr/idp-mcp-bridge-oauth-plan.md`（第 2、3、5、7 节）；对外互通 ADR 草案 D-X1、D-X2、D-X4；idp-mcp ADR-0001 D12、D44、D50 到 D53；idp-web ADR-0001 D1、D2、D6 到 D8、D14、D22、D24；idp-workspace ADR-0001 D16；MCP 2026-07-28 |
 
@@ -55,6 +55,11 @@
 | D35 | **再次授权时，被取代的令牌向授权服务器撤销** | D29 只说了断开与运维的撤销；再授权（`reauthorization_required` 之后、`insufficient_scope` 之后、或成员已连接时再点"连接"，评审账号同样）也会替换授权，旧授权的刷新令牌若不处理就一直有效，平台验收在授权服务器替身的记录里看到了这一点。`Finish` 在**新授权已存入之后**，对**旧授权**走与断开同一条撤销路径（`revoke`：RFC 7009，先刷新令牌、再访问令牌，授权服务器没有撤销端点则什么也不做），**不持有任何行锁**，撤销的失败**只记码**，绝不撤销已存的新授权，`Finish` 照常成功。不撤销：与新授权里相同的令牌（`keep`）、以及签发者不是连接现在钉死的 issuer 的旧授权的令牌（令牌只出示给签发它的服务器：issuer 变了，旧令牌不能发给新的服务器）。成员的授权与同一个人的评审授权各自只撤销自己的旧令牌。限制：读旧授权与写新授权之间没有锁，这个窗口里别的副本刚刷新出的令牌不会被撤销（它在这次替换之后本来也不再被使用，到期即失效） |
 | D36 | **令牌端点的错误：有 `error` 的应答就是错误，不论状态码；GitHub 的两个码按 `invalid_grant` 处理（已知的偏离，只列这两个）** | RFC 6749 5.2 规定错误是 400 加 `error`；GitHub 的令牌端点（`/login/oauth/access_token`）对错误答 **200** 加 `{"error": ...}`（`bad_verification_code`：码错或已用；`bad_refresh_token`：刷新令牌过期或被撤销；`incorrect_client_credentials`、`redirect_uri_mismatch`、`unverified_user_email`）。此前桥把这样的 200 当成"令牌应答不合格"（缺 `token_type`），于是一个已死的刷新令牌永远是"暂时无法更新"，授权不会被删除、成员不会被要求重新授权。现在：`TokenRequest` 先看 5xx 与 429（可重试，同前），然后**应答体里有非空 `error` 就是错误应答，不论状态**（状态不是 200 的同前）；映射同前（固定的一组 RFC 码，其余是 `unknown`），**只读 `error`，从不读 `error_description`**。**已知偏离的映射**，明确列出、保持很小：`bad_verification_code` 与 `bad_refresh_token` 视为 `invalid_grant`（刷新时删除授权、成员被告知重新授权；换码时授权失败的原因是 `invalid_grant`）；GitHub 其余三个码（以及任何别的未知码）是令牌端点的错误，授权不删除、详情写日志里的码，**不是**死授权（测试：`incorrect_client_credentials` 的 200 不删除授权）。这个映射表对所有授权服务器生效（码只在对方真的发这些词时才出现），要加新码是一次有意的修改。**授权地址的内容**见 D37（本条原先写的"没有配置范围就取资源元数据的整串"已被 D37 取代）。|
 | D37 | **最小权限：授权请求只要连接文件里配置的 `scopes`；没有配置就不带 `scope`；资源元数据的范围表只在明确选择时才用** | MCP 规范的范围选择策略（以及官方 SDK）：`WWW-Authenticate` 的 `scope`，否则资源元数据的 `scopes_supported`，否则授权服务器的。B2 按这个次序实现，连接文件的 `scopes` 为空时就去要资源列出的**全部**范围。对企业平台，这个缺省不对：运维没有列范围，却会向成员要第三方提供的一切，可能包括写权限（用 OAuth App 而不是 GitHub App 连 GitHub，会要 `repo`、`write:packages`、`gist`……）。**这是有意偏离规范的 SHOULD。**新规则：授权请求要**恰好是**连接配置的 `scopes`（评审账号：`reviewerScopes`，没有则 `scopes`，同一条规则，没有回退）；没有配置就**没有 `scope` 参数**，也就没有 `offline_access` 与 `prompt`（`offline_access` 只在范围非空、且授权服务器的 `scopes_supported` 含它时追加，同前）。资源元数据的 `scopes_supported` 只在连接写了 `authorization.scopesFromResource: true`（缺省 false；`mode: none` 的连接写它是错误）时才作为 `scopes` 为空时的回退——这是运维对"要第三方列出的全部"的明确同意。**升级范围（D27）仍然并入第三方质询里的 `scope`**：那是第三方在 403 之后点名要的某一个范围，成员会在同意页上看到；但它**可能扩大授权**（一个行为不端的第三方可以一再要求更大的范围），所以桥把**新增的范围名**写进日志（只有范围名，且只有合法的 RFC 6749 范围记号，`scope asked for by the third party's challenge`，带连接与租户），运维可以据此发现。GitHub App 忽略 `scope`（权限在 App 的设置里），所以 `scopes: []` 是 GitHub 的正确写法。测试：七种组合（没有配置：有无资源列表、有无 `offline_access` 都没有 `scope`；选择加入：用资源的列表；配置的优先；评审账号同样），升级仍然并入、日志里有新增的名字 |
+| D38 | **"成员离开"接口：只许平台的服务，用 OIDC 客户端凭据令牌；处理与 `revoke` 命令相同；幂等** | 计划 `idp-mcp-bridge-offboarding-plan.md` 第 1、2 节。`POST /internal/v1/members/offboard`，正文 `{"tenant","member","reason"}`，`reason` 是固定的一组：`user_deleted`、`user_disabled`、`tenant_changed`、`operator`、`other`（别的值与多余的字段都是 400）。**认证**：调用方用 OIDC 客户端凭据模式取得服务令牌；桥用现有的发行方与公钥验签（同 D28：签名、issuer、受众、`exp`），要求 `azp` 在 `IDP_BRIDGE_OFFBOARD_CLIENTS`（逗号分隔）里；**这个名单为空则接口不存在（404）**。令牌无效是 401；有效但不是服务的（`azp` 不在名单里，或令牌属于一个成员：有会话 `sid` 或是委托 `act`，或是 Workspace 换来的成员令牌，其 `azp` 是 Workspace 的客户端）是 403。限制要写明：桥靠 `azp` 名单与"没有会话、不是委托"区分服务与成员，所以名单里应当只放专用的服务客户端，不要放会签发成员令牌的客户端。**处理**（`oauth.Service.Offboard`，`revoke` 命令也走它）：对成员的每个授权，向授权服务器撤销（刷新令牌在先、访问令牌在后，D29，GitHub 连接见 D42），不论撤销成败都删除授权；删除成员未完成的授权状态；标记他授权的评审账号（D40）；一个连接的 `revoke --connection` 限定到那一条连接时不算离开，不动未完成的授权与评审账号。**幂等**：重复调用、成员本来就没有授权，都是 200 加零。**答案只有计数**：`{"grants_removed","revocations_failed","reviewer_grants_marked"}`，没有令牌、没有授权服务器的地址。**审计与计数**：一行 `audit`（`event: offboard`，租户、成员的哈希前缀、`reason`、`source`（route、reconcile、command）、`caller`（服务的 `azp`）、连接、授权数、撤销失败数、状态数），计数器 `idp_bridge_offboard_total{reason,source}`、`_grants_removed_total`、`_revocation_failed_total`。**不由安全闸限制**（一次一个成员），但每次都写审计 |
+| D39 | **兜底对账：目录适配器是接口；Keycloak 适配器只用于开发测试；只认明确结果；安全闸；一次一个副本** | 身份系统还没选定，**核心里没有任何东西依赖 Keycloak 的管理接口**：`directory.Directory.Lookup(ctx, tenant, member)` 返回 `present`、`disabled`、`deleted`、`moved`（换了租户）、`unknown`（任何错误都是它）。`reconcile.Reconciler` 每 `IDP_BRIDGE_RECONCILE_INTERVAL`（缺省 15 分钟，`0` 关闭，至少 1 秒）一轮：把库里每个不同的（租户、成员）（只算成员自己的授权，评审账号不算）交给目录；**`unknown` 一律不动**（超时、出错、没权限、应答不像用户，记一条不带错误正文的日志，下一轮再查）；`deleted`、`disabled`、`moved` 按接口同一条路径离开，原因分别是 `user_deleted`、`user_disabled`、`tenant_changed`。**安全闸**：一轮里判定离开的成员**不少于 5 人且多于已知成员的 20%** 时，这一轮什么都不做，日志里一条 ERROR 级的告警（`reconciliation brake`）加计数器 `reconcile_brake_total`；运维核对之后用 `idp-mcp-bridge reconcile --now --force` 越过（`reconcile --now` 不带 `--force` 仍受闸约束；目录整个不可达时全是 `unknown`，不触发闸也不撤任何东西）。**一次一个副本**：一轮开始时取 PostgreSQL 咨询锁（`TryLock`，保持到一轮结束，副本死了连接断开就释放），取不到的副本这一轮是 `busy`，什么也不做。`IDP_BRIDGE_DIRECTORY=none`（缺省）没有对账；`keycloak-dev` 是 `internal/directory/keycloakdev`，**明确标为开发测试用**，启动时日志有一行说明：一个带服务账号的保密客户端（`IDP_BRIDGE_KEYCLOAK_URL`、`_REALM`、`_CLIENT_ID`、`_CLIENT_SECRET_FILE`，租户属性名 `_TENANT_ATTRIBUTE` 缺省 `tenant_id`），用客户端凭据取令牌（缓存到到期前 30 秒，401 时换一次再试），`GET /admin/realms/{realm}/users/{sub}`：404 且正文是 Keycloak 的 `User not found` 才是 `deleted`（realm 不存在的 404 不是）；`enabled: false` 是 `disabled`；租户属性不是授权的租户是 `moved`；同租户且启用是 `present`；没有租户属性、没有 `enabled`、`id` 不是这个成员、不像用户的正文、5xx、403、429、不可达，都是 `unknown`；可能是路径的成员 id（含 `/`、空）不去查。以后换成最终身份系统的 SCIM 查询（`GET /Users/{id}`）或它自己的目录接口，只是再写一个适配器。**重新启用不会自动恢复**：授权已经删除，成员要重新连接 |
+| D40 | **评审账号的授权人离开：保留、标记、告警，不撤销** | 授权人（`authorized_by`）离开（接口或对账）时，撤掉评审账号会让这个服务对所有成员不可用，所以保留；迁移 `0003_offboarding.sql` 给 `grants` 加 `authorizer_left`，`MarkAuthorizerLeft` 标记他授权的评审授权；日志 `the operator who authorized a reviewer account left: re-authorize it`（WARN）与计数器 `idp_bridge_reviewer_authorizer_left_total`；运维看到的列表里这条连接的 `reviewer` 是 `{"status":"connected","reason":"authorizer_left"}`（还能用，所以仍是 `connected`）；成员的列表没有这个键。由别的运维重新授权评审账号时新授权替换旧授权，标记随之清除。评审账号的令牌**从不**因此撤销。**对账也要找到他**：授权评审账号的运维可能自己没有任何成员授权，所以一轮对账除了有成员授权的人，还查评审授权里不同的 `authorized_by`（按存下来的样子解析：第一个 `/` 前是租户、后是成员；解析不了的跳过并记一条不带内容的日志；已经标记的不再查，告警只发一次）。这样的人：仍在或查不清 → 不动；已删除、已停用、换了租户 → **只**标记评审账号（`AuthorizerLeft`，审计 `event: authorizer_left`、告警、计数器）；同时有成员授权的人照旧整个离开（接口那条路径，里面已经标记），不重复计数。他们**与成员一样计入安全闸的分母与分子**（否则一次错误的"都离开了"会标记所有评审账号） |
+| D41 | **撤销没能确认：断开之后列表里如实说** | 成员断开时授权总是删除（D29），但如果向第三方的撤销失败，成员在 Workspace 里应当知道要去第三方那里自己撤销：表 `unconfirmed_revocations`（租户、成员、连接，时间），列表里这条连接是 `not_connected` 加 `reason: revocation_unconfirmed`；成员重新连接（`Finish`）时清除。只记成员自己的断开，不记离开的成员（没有人会看到）。适用于任何撤销机制，GitHub 的两个接口都失败时（D42）是它最常见的来源 |
+| D42 | **GitHub 的撤销：`revocation: github`，用 GitHub 自己的接口** | GitHub 的授权服务器没有 RFC 7009 的撤销端点，成员断开、再授权、离开之后，桥里的令牌删了，GitHub 那边的刷新令牌还能用约半年。连接配置加可选的 `authorization.revocation: github`（只对**预注册的客户端**有效：GitHub 的接口用应用的客户端 id 与密钥做 Basic 认证；写在 CIMD 客户端或不要令牌的连接上是配置错误）。断开、离开（接口与对账）、`revoke` 命令、评审账号的断开：`DELETE https://api.github.com/applications/{client_id}/grant`，Basic `client_id:client_secret`，JSON 正文 `{"access_token": "<这个授权当前的访问令牌>"}`，头 `Accept: application/vnd.github+json`、`X-GitHub-Api-Version: 2022-11-28`、`Content-Type: application/json`；走检查过地址的出口客户端，应答体有界，30 秒的时限。**204 是已撤销；404 与 422 当作已经没有了**（记一条日志，带状态码，不算失败）；**别的都是失败**，失败时再试 `DELETE /applications/{client_id}/token`（只撤这一个访问令牌）；两个都失败才算撤销失败（只记状态码，授权照样删除，D29；断开时记 D41）。**访问令牌已过期怎么办（本期的选择）**：如果存着的访问令牌已经过了到期时间，而授权有刷新令牌，就**先刷新一次**再出示新的令牌，理由是这个接口靠一个它认得的访问令牌指出是哪个授权，刷新是出示一个能被接受的令牌的唯一办法，代价是多一次刷新（结果马上被撤销）；没有刷新令牌，或刷新失败，就出示存着的旧令牌（GitHub 答 404 就是已经没有了）；没过期的不刷新。**再授权（D35）不用整个授权的接口**：同一个用户对同一个应用的授权 GitHub 那边只有一个，删了它新颁发的令牌也一起没了，所以被取代的访问令牌只走 `/token` 接口。**待核实**：GitHub 现行文档说 OAuth App 与 GitHub App 的所有者都能用 `/grant`，旧版文档说它不适用于 GitHub App 的用户令牌；本期按现行文档写，用替身测，**在下一次真实 GitHub 验证之前一直记为未核实**，实测要看：`/grant` 对 GitHub App 的过期用户令牌是否答 204，答 404/422 时刷新令牌是否确实也失效，`/token` 是否同时让刷新令牌失效。如果两个接口都不行，桥会如实在列表里写"撤销未确认"（D41），日志与计数器里是失败，运维提示成员到 GitHub 的 Settings → Applications 自己撤销 |
 
 ## 3. 对计划与相邻决策的反馈（B1、B2 中发现的）
 
@@ -318,3 +323,54 @@
 | B6R-5 | `mode: none` 的连接可以写 `scopesFromResource` | `TestScopesFromResourceIsAnOptInForOAuthConnectionsOnly` |
 
 5 项全部失败。D27 的并集（升级后再授权要配置的范围与质询的范围的并集）由原有的 `TestInsufficientScopeAsksTheMemberToAuthorizeAgainForTheUnionAndAPlain403IsJustRefused` 与上面的升级测试覆盖（B2R-35、B2R-37 仍然有效）。
+
+## 11. 反向验证（D38 到 D42）
+
+同第 5 节，在 PostgreSQL 上做。
+
+| # | 去掉的控制（改动） | 失败的测试 |
+|---|---|---|
+| B7R-1 | 任何客户端的服务令牌都能调用接口（不查 `azp` 允许名单） | `TestAServiceTokenIsAClientCredentialsTokenOfAClientOnTheAllowListAndNothingElseIs` |
+| B7R-2 | 成员的令牌（有会话 `sid`、或是委托 `act`）也被接受为服务令牌 | `TestAServiceTokenIsAClientCredentialsTokenOfAClientOnTheAllowListAndNothingElseIs` |
+| B7R-3 | 接口的正文不严格（多余字段也收） | `TestTheRouteIsForServicesOnTheAllowListOnlyAndDisabledWithoutOne` |
+| B7R-4 | 原因不限于固定的一组 | `TestTheRouteIsForServicesOnTheAllowListOnlyAndDisabledWithoutOne` |
+| B7R-5 | 审计行里的原因不是实际的原因 | `TestOffboardingIsAuditedWithTheReasonAndTheCallerAndCountedAndAFailedRevocationDoesNotKeepTheGrant` |
+| B7R-6 | 成员离开时不删他未完成的授权 | `TestAServiceTellsTheBridgeAMemberLeftAndEverythingOfTheMembersGoes` |
+| B7R-7 | 不标记授权人离开的评审账号 | `TestWhenTheAuthorizerOfAReviewerAccountLeavesTheAccountIsKeptMarkedAndNotRevoked` |
+| B7R-8 | 授权人离开时评审账号被删除而不是标记（存储） | `TestDisconnectingTheReviewerAccountRevokesItsTokensAtTheServer`, `TestTheStoreKnowsWhoTheMembersAreAndForgetsAMembersPendingAuthorizationsAndMarksTheAuthorizersReviewerAccounts`, `TestWhenTheAuthorizerOfAReviewerAccountLeavesTheAccountIsKeptMarkedAndNotRevoked` |
+| B7R-9 | 列表不显示 `authorizer_left` | `TestWhenTheAuthorizerOfAReviewerAccountLeavesTheAccountIsKeptMarkedAndNotRevoked` |
+| B7R-10 | 运维只撤一条连接时也当作离开（清未完成的授权、标记评审账号） | `TestTheOperatorsRevokeCommandIsTheSamePathWithReasonOperator` |
+| B7R-11 | 撤销失败不计数 | `TestGitHubSaying404Or422MeansAlreadyGoneAndAnythingElseFallsBackToTheTokenEndpointAndThenFails`, `TestOffboardingIsAuditedWithTheReasonAndTheCallerAndCountedAndAFailedRevocationDoesNotKeepTheGrant` |
+| B7R-12 | 令牌撤销失败不算失败 | `TestOffboardingIsAuditedWithTheReasonAndTheCallerAndCountedAndAFailedRevocationDoesNotKeepTheGrant` |
+| B7R-13 | 安全闸不要求至少 5 人 | `TestTheSafetyBrakeHoldsARoundInWhichMoreThanAFifthAndAtLeastFiveWouldGoUnlessForced` |
+| B7R-14 | 安全闸是不少于 20% 而不是多于 20% | `TestTheSafetyBrakeHoldsARoundInWhichMoreThanAFifthAndAtLeastFiveWouldGoUnlessForced` |
+| B7R-15 | `--force` 不能越过安全闸 | `TestTheReconcileCommandRunsOneRoundAndForceGoesPastTheBrake`, `TestTheSafetyBrakeHoldsARoundInWhichMoreThanAFifthAndAtLeastFiveWouldGoUnlessForced` |
+| B7R-16 | 目录出错也当作已删除 | `TestAnythingThatIsNotAClearAnswerDoesNothing` |
+| B7R-17 | 对账的原因不取自查询结果 | `TestAMemberWhoIsDeletedDisabledOrMovedIsOffboardedWithTheReasonOfTheLookupAndNobodyElseIs` |
+| B7R-18 | 对账不加锁，两个副本可以同时跑 | `TestOnlyOneReplicaReconcilesAtATime` |
+| B7R-19 | 评审账号也算成员 | `TestAMemberWhoIsDeletedDisabledOrMovedIsOffboardedWithTheReasonOfTheLookupAndNobodyElseIs`, `TestAnythingThatIsNotAClearAnswerDoesNothing`, `TestTheSafetyBrakeHoldsARoundInWhichMoreThanAFifthAndAtLeastFiveWouldGoUnlessForced` |
+| B7R-20 | Keycloak 的任何 404 都是已删除（包括 realm 不存在） | `TestTheAdapterGivesOnlyClearAnswers` |
+| B7R-21 | 没有 `enabled` 的应答也当作用户 | `TestTheAdapterGivesOnlyClearAnswers` |
+| B7R-22 | 别的用户的应答也当作这个用户的 | `TestTheAdapterGivesOnlyClearAnswers` |
+| B7R-23 | 没有租户属性也当作仍在 | `TestTheAdapterGivesOnlyClearAnswers` |
+| B7R-24 | 可能是路径的成员 id 也去查 | `TestWhenKeycloakCannotBeAskedTheAnswerIsUnknownAndNothingIsAsked` |
+| B7R-25 | 断开时只撤销单个令牌、不删 GitHub 上的整个授权 | `TestDisconnectingFromGitHubDeletesTheMembersGrantAtGitHubWithTheApplicationsCredentials`, `TestGitHubSaying404Or422MeansAlreadyGoneAndAnythingElseFallsBackToTheTokenEndpointAndThenFails`, `TestTheReviewerAccountAndTheOperatorsRevokeUseGitHubsAPIToo` |
+| B7R-26 | 再授权时也删整个 GitHub 授权（会同时撤销新令牌） | `TestAuthorizingAgainAtGitHubRevokesOnlyTheOldTokenAndNeverTheGrant` |
+| B7R-27 | 整个授权的接口失败时不试令牌接口 | `TestGitHubSaying404Or422MeansAlreadyGoneAndAnythingElseFallsBackToTheTokenEndpointAndThenFails` |
+| B7R-28 | 404 不算已经没有了 | `TestGitHubSaying404Or422MeansAlreadyGoneAndAnythingElseFallsBackToTheTokenEndpointAndThenFails` |
+| B7R-29 | 访问令牌已过期也不先刷新 | `TestAnExpiredAccessTokenIsRefreshedFirstIfThereIsARefreshTokenAndOtherwiseThePresentedOneIsTheStaleOne` |
+| B7R-30 | 撤销没能确认时不记录 | `TestAMemberWhoseRevocationCouldNotBeConfirmedIsToldSoInTheListUntilTheyConnectAgain` |
+| B7R-31 | 重新连接不清除撤销未确认 | `TestAMemberWhoseRevocationCouldNotBeConfirmedIsToldSoInTheListUntilTheyConnectAgain` |
+| B7R-32 | GitHub 的 Basic 认证不用应用的密钥 | `TestAMemberWhoseRevocationCouldNotBeConfirmedIsToldSoInTheListUntilTheyConnectAgain`, `TestAnExpiredAccessTokenIsRefreshedFirstIfThereIsARefreshTokenAndOtherwiseThePresentedOneIsTheStaleOne`, `TestDisconnectingFromGitHubDeletesTheMembersGrantAtGitHubWithTheApplicationsCredentials` |
+| B7R-33 | `revocation: github` 也允许用于非预注册的客户端 | `TestRevocationGitHubIsForPreregisteredClientsOnly` |
+| B7R-34 | 对账间隔没有下限 | `TestTheOffboardingAndDirectorySettingsAreCheckedAndTheRouteAndTheDirectoryAreOffByDefault` |
+
+34 项全部失败。
+
+| B8R-1 | 对账不查评审授权的授权人 | `TestAnAuthorizerThatIsNotTenantSlashMemberIsSkippedAndLogged`, `TestAnAuthorizerWithNoMemberGrantsIsLookedUpAndWhenHeLeavesOnlyTheAccountIsMarked`, `TestTheBrakeCountsAuthorizersWithNoMemberGrantsToo` |
+| B8R-2 | 没有成员授权的授权人离开时也整个"离开"，而不是只标记账号 | 同上三项 |
+| B8R-3 | 解析不了的授权人也去查 | `TestAnAuthorizerThatIsNotTenantSlashMemberIsSkippedAndLogged` |
+| B8R-4 | 既有成员授权又授权评审账号的人算两次 | `TestAMemberWhoIsDeletedDisabledOrMovedIsOffboardedWithTheReasonOfTheLookupAndNobodyElseIs`, `TestAnAuthorizerWhoAlsoHoldsMemberGrantsIsOffboardedOnceAndNotCountedTwice` 等 |
+| B8R-5 | 已经标记的账号的授权人每轮都再查（存储） | `TestAnAuthorizerWhoAlsoHoldsMemberGrantsIsOffboardedOnceAndNotCountedTwice`, `TestTheStoreListsTheAuthorizersOfReviewerAccountsThatAreNotYetMarked` |
+
+（B8R 是 D40 的补充：对账找到没有成员授权的授权人；5 项全部失败。）

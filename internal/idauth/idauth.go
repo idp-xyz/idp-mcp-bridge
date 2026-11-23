@@ -16,6 +16,7 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"slices"
 	"sync"
 	"time"
 
@@ -45,6 +46,35 @@ type Verifier struct {
 	// one. ReviewerTenant, if set, is the only tenant whose holders of the role are (ADR-0001 D33).
 	ReviewerRole, ReviewerTenant string
 	RolesClaim                   string // default "roles"
+	// ServiceClients are the OIDC clients (azp) whose client-credentials tokens may call the offboarding route (ADR-0001 D38);
+	// empty: the route is disabled.
+	ServiceClients []string
+}
+
+// AuthenticateService verifies the token of a service that calls the "member left" route: an OIDC client-credentials token, the
+// same issuer, keys, audience and expiry as a member's, whose azp is one of ServiceClients. A token that is not valid is
+// api.ErrUnauthenticated; one that is valid but not a service's (a client not on the list, or a token of a member: it has a session
+// (`sid`) or is a delegation (`act`)) is api.ErrForbidden. It returns the azp, for the audit.
+func (v *Verifier) AuthenticateService(ctx context.Context, bearer string) (string, error) {
+	claims := jwt.MapClaims{}
+	leeway := v.Leeway
+	if leeway == 0 {
+		leeway = 30 * time.Second
+	}
+	_, err := jwt.ParseWithClaims(bearer, claims, func(t *jwt.Token) (any, error) {
+		kid, _ := t.Header["kid"].(string)
+		return v.Keys.Key(ctx, kid)
+	}, jwt.WithValidMethods(algorithms), jwt.WithIssuer(v.Issuer), jwt.WithAudience(v.Audience), jwt.WithExpirationRequired(), jwt.WithLeeway(leeway))
+	if err != nil {
+		return "", api.ErrUnauthenticated
+	}
+	azp, _ := claims["azp"].(string)
+	_, hasSession := claims["sid"]
+	_, hasAct := claims["act"]
+	if azp == "" || !slices.Contains(v.ServiceClients, azp) || hasSession || hasAct {
+		return "", api.ErrForbidden
+	}
+	return azp, nil
 }
 
 // Authenticate verifies a bearer token and returns the member it names: the subject and the tenant claim. Every failure is

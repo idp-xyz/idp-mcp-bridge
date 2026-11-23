@@ -8,26 +8,10 @@ import (
 	"idp-mcp-bridge/internal/sealer"
 )
 
-// RevokeMember is the operator's offboarding of a member (or of a member's one connection): each grant is revoked at its
-// authorization server, best effort, if the connection is still configured and the server has a revocation endpoint, and is
-// deleted whether or not that worked. It returns how many grants went.
+// RevokeMember is the operator's removal of a member's grants (or of one connection's): see Offboard. It returns how many grants went.
 func (s *Service) RevokeMember(ctx context.Context, tenant, member, connection string) (int, error) {
-	gs, err := s.Store.ForMember(ctx, tenant, member)
-	if err != nil {
-		return 0, err
-	}
-	n := 0
-	for _, g := range gs {
-		if connection != "" && g.Connection != connection {
-			continue
-		}
-		s.Revoke(ctx, g)
-		if err := s.Store.Delete(ctx, g.Key); err != nil {
-			return n, err
-		}
-		n++
-	}
-	return n, nil
+	res, err := s.Offboard(ctx, OffboardRequest{Tenant: tenant, Member: member, Connection: connection, Reason: ReasonOperator, Source: "command"})
+	return res.GrantsRemoved, err
 }
 
 // RevokeConnection deletes every member's grant of a connection that the operator withdrew. Their tokens are not revoked at

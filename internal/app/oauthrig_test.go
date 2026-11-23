@@ -21,6 +21,7 @@ import (
 	"idp-mcp-bridge/internal/bridge"
 	"idp-mcp-bridge/internal/config"
 	"idp-mcp-bridge/internal/egress"
+	"idp-mcp-bridge/internal/githubdouble"
 	"idp-mcp-bridge/internal/grants"
 	"idp-mcp-bridge/internal/grants/pgtest"
 	"idp-mcp-bridge/internal/mcp/mcptest"
@@ -86,6 +87,7 @@ type orig struct {
 	gw    *mcptest.Gateway
 	tp    *thirdparty.Double
 	as    *asdouble.Server
+	gh    *githubdouble.Server
 	doc   *httptest.Server
 	store grants.Store
 	keys  *sealer.Keys
@@ -132,9 +134,10 @@ func newORig(t *testing.T, o orgOpts) *orig {
 	if o.store.make == nil {
 		o.store = storeKinds()[0]
 	}
-	r := &orig{t: t, gw: mcptest.New(), tp: thirdparty.New(), as: asdouble.New(), log: &bytes.Buffer{}, met: bridge.NewMetrics(), keys: testKeys(t, "k1")}
+	r := &orig{t: t, gw: mcptest.New(), tp: thirdparty.New(), as: asdouble.New(), gh: githubdouble.New("Iv1.abc", "s3cret"), log: &bytes.Buffer{}, met: bridge.NewMetrics(), keys: testKeys(t, "k1")}
 	t.Cleanup(r.tp.Close)
 	t.Cleanup(r.as.Close)
+	t.Cleanup(r.gh.Close)
 	r.as.CIMD = true
 	r.store, r.open = o.store.make(t)
 	// the Workspace serves the client metadata document; its content is the bridge's (svc.ClientMetadata)
@@ -154,7 +157,7 @@ func newORig(t *testing.T, o orgOpts) *orig {
 	if o.mod != nil {
 		o.mod(r)
 	}
-	origins := map[string]bool{r.tp.Origin(): true, r.as.Origin(): true, strings.TrimPrefix(r.doc.URL, "http://"): true}
+	origins := map[string]bool{r.tp.Origin(): true, r.as.Origin(): true, r.gh.Origin(): true, strings.TrimPrefix(r.doc.URL, "http://"): true}
 	yaml := defaultYAML
 	if o.yaml != nil {
 		yaml = o.yaml
@@ -174,8 +177,29 @@ func newORig(t *testing.T, o orgOpts) *orig {
 	if r.mcp, err = Handler(cs, opts); err != nil {
 		t.Fatal(err)
 	}
-	r.api = api.New(testAuthenticator{}, r.svc)
+	r.svc.Counters = r.met
+	r.svc.GitHubAPI = r.gh.URL
+	h := api.New(testAuthenticator{}, r.svc)
+	h.EnableOffboarding(testServiceAuth{}, oauth.OffboardAPI{S: r.svc})
+	r.api = h
 	return r
+}
+
+// testServiceAuth is the verifier of the "member left" route as the tests need it: "svc:<azp>" is a service token of that client (the
+// allow-list is lifecycle and lifecycle2), "m:..." and "r:..." are members' tokens, anything else is not a token.
+type testServiceAuth struct{}
+
+func (testServiceAuth) AuthenticateService(_ context.Context, bearer string) (string, error) {
+	if azp, ok := strings.CutPrefix(bearer, "svc:"); ok {
+		if azp == "lifecycle" || azp == "lifecycle2" {
+			return azp, nil
+		}
+		return "", api.ErrForbidden
+	}
+	if strings.HasPrefix(bearer, "m:") || strings.HasPrefix(bearer, "r:") {
+		return "", api.ErrForbidden
+	}
+	return "", api.ErrUnauthenticated
 }
 
 // testAuthenticator takes "Bearer m:<tenant>:<member>" for the token the Workspace would send, and "r:<tenant>:<member>" for the

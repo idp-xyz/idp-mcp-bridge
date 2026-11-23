@@ -70,6 +70,7 @@ POST /api/v1/servers/{id}/approve         {"digest":"<看过的目录摘要>"}
 | `IDP_BRIDGE_REDIRECT_URI` | **Workspace 的回调页**，所有连接共用，公网 https、无片段。它是配置，不是请求的字段：能指定它的调用者能把授权码送到自己的地址。授权服务器上登记（预注册客户端）或客户端元数据文档里写的 `redirect_uris` 就是它 |
 | `IDP_BRIDGE_OIDC_ISSUER`、`IDP_BRIDGE_API_AUDIENCE`、`IDP_BRIDGE_WORKSPACE_CLIENT` | 验证 Workspace 对内部 API 的调用（ADR D28）：Keycloak 的 realm、令牌的受众（Workspace 换令牌时的 `audience`）、唯一被接受的 `azp`（Workspace 的令牌交换客户端）。`IDP_BRIDGE_OIDC_JWKS_URL`（缺省 `<issuer>/protocol/openid-connect/certs`）必须是 https；集群内只有 http 时要显式设 `IDP_BRIDGE_OIDC_ALLOW_HTTP=true`（启动日志警告：决定谁能调用的密钥经 http 取）。`IDP_BRIDGE_OIDC_CA_FILE` 给它加一个 CA。`IDP_BRIDGE_TENANT_CLAIM`（缺省 `tenant_id`）是租户声明 |
 
+| `IDP_BRIDGE_OFFBOARD_CLIENTS`、`IDP_BRIDGE_DIRECTORY`、`IDP_BRIDGE_RECONCILE_INTERVAL`、`IDP_BRIDGE_KEYCLOAK_*` | 成员离开（第 5.9 节）：允许调用"成员离开"接口的服务客户端（为空则接口不存在）、对账的目录（缺省 `none`）、对账间隔（缺省 15m，`0` 关闭）、开发测试用的 Keycloak 适配器的设置 |
 | `IDP_BRIDGE_REVIEWER_ROLE`、`IDP_BRIDGE_REVIEWER_TENANT`、`IDP_BRIDGE_ROLES_CLAIM` | 谁可以授权评审账号（第 5.6 节）：令牌里 `roles` 声明（可改）含这个 realm 角色，设了租户则还要是这个租户。**没有缺省，不设就没有人能**；只设租户不设角色是配置错误 |
 
 **Keycloak 要做的**：一个客户端代表桥（它的 client id 就是 `IDP_BRIDGE_API_AUDIENCE`），允许 Workspace 的令牌交换客户端把成员的令牌换成以它为受众的令牌（idp-workspace 的 `auth: exchange` 配置里 `audience` 填它）；令牌要带租户声明；**要用评审账号的话，换来的令牌还要带 `roles` 声明**（桥的客户端要有 realm 角色的映射，平台的 realm 在用户的映射里有 `roles`，换出的令牌是否带上要在你的 Keycloak 里确认）。桥的出口策略要放到 Keycloak 的 JWKS（`networkpolicy.yaml` 的 `bridge-keycloak`，按你的 Keycloak 调整命名空间、标签与端口）。
@@ -129,7 +130,7 @@ kubectl -n idp-mcp-bridge create secret generic idp-mcp-bridge-database \
 
 - 成员自己断开：Workspace 的 `DELETE .../grant`。**再授权**（重新连接、`reauthorization_required` 或 `insufficient_scope` 之后重新授权，评审账号同）会替换授权，被取代的刷新令牌与访问令牌在新授权存入之后向授权服务器撤销（尽力而为，失败只记日志里的码，不影响新授权；服务器没有撤销端点则不做；ADR D35）。
 - 运维：`idp-mcp-bridge revoke --tenant T --member M [--connection C]`：成员的授权（或这一条连接上的）逐条向授权服务器撤销（连接还在配置里、对方有撤销端点时，尽力而为），再删除；`idp-mcp-bridge revoke --connection C`：一条被撤下的连接的所有授权，直接删除（不向对方撤销：它们不按连接列出，连接多半已经不在文件里了）。命令需要与服务相同的数据库、密钥文件与（撤销要用的）连接文件设置。
-- **未做（记为开放）**：成员离开租户时自动清理。身份提供方不会通知桥，桥也不扫描；离职流程要调用 `revoke`。管理员撤销某个成员的授权也只有这条命令。
+- 成员**离开**（账号被删除、停用、换了租户）：见 5.9：平台的服务调用"成员离开"接口，对账是兜底；`revoke` 命令仍可用。
 
 ### 5.5 常见的授权问题
 
@@ -181,13 +182,34 @@ IDP_BRIDGE_REVIEWER_TENANT=<运维的租户>        # 可选
       issuer: https://github.com/login/oauth
       client: {mode: preregistered, id: <GitHub App 的 Client ID>, secretFile: /etc/idp/secrets/github}
       scopes: []          # GitHub App 忽略 scope，权限在 App 的设置里；没有配置就不请求任何范围
+      revocation: github  # 断开、再授权、离开时向 GitHub 撤销（5.10）；不写则只删除授权
 ```
 
 - **客户端是预注册的 GitHub App，要开"Expire user authorization tokens"**（过期的用户令牌：访问令牌 8 小时、刷新令牌 6 个月，刷新时轮换）。GitHub 不支持客户端元数据文档（`client_id_metadata_document_supported` 没有）也没有动态注册，所以只能预注册；回调地址（Callback URL）填 `IDP_BRIDGE_REDIRECT_URI`；"Request user authorization (OAuth) during installation"按需。
 - **授权地址**：`scopes: []` 时**没有 `scope` 参数**（也没有 `offline_access`、`prompt`），只有 `response_type`、`client_id`、`redirect_uri`、`state`、`code_challenge`、`resource`（ADR D37：最小权限，不会向成员要资源列出的全部范围）。GitHub App 的权限在 App 的设置里。
-- **GitHub 没有撤销端点**（元数据里没有 `revocation_endpoint`）：成员断开、再授权、运维 `revoke` 都**只删除授权**，不向 GitHub 撤销；访问令牌在 8 小时内自己失效，刷新令牌随 App 的授权一起在 GitHub 那里由成员自己撤销（Settings → Applications）。
+- **GitHub 没有 RFC 7009 的撤销端点**（元数据里没有 `revocation_endpoint`）。连接里写 `revocation: github`（5.10）才会向 GitHub 撤销；不写则断开、再授权、`revoke` 都**只删除授权**，访问令牌在 8 小时内自己失效，刷新令牌（约半年）要成员自己在 GitHub 撤销（Settings → Applications）。
 - **GitHub 的令牌端点用 HTTP 200 回错误**（`error` 字段）。桥按 ADR D36 处理：`bad_refresh_token`、`bad_verification_code` 是 `invalid_grant`（授权被删除、成员被告知重新授权）；`incorrect_client_credentials`（客户端密钥错）、`redirect_uri_mismatch`（回调地址与 App 里的不同）、`unverified_user_email` 是令牌端点的错误：看日志里的码，授权不会被删除。
 - 评审账号（5.6）用一个专门的 GitHub 账号授权同一个 App；`mcp/readonly` 只读，是评审账号的合适端点。
+
+### 5.9 成员离开：接口、对账、评审账号
+
+**问题**：成员的账号被删除、停用或换了租户之后，桥库里还有他的刷新令牌，第三方那边他的授权也还在。**阻止使用已经是实时的**（身份系统不再给他令牌，网关不再替他签身份）；这里是善后。身份系统还没选定，**核心不依赖 Keycloak 的任何接口**（ADR D38、D39）。
+
+**1. "成员离开"接口**（端口 8681，实时）：`POST /internal/v1/members/offboard`，正文 `{"tenant":"acme","member":"<sub>","reason":"user_deleted"}`，`reason` 是 `user_deleted`、`user_disabled`、`tenant_changed`、`operator`、`other` 之一。认证：**OIDC 客户端凭据模式的服务令牌**（与桥的 `IDP_BRIDGE_OIDC_ISSUER` 同一个发行方，受众是 `IDP_BRIDGE_API_AUDIENCE`），`azp` 必须在 `IDP_BRIDGE_OFFBOARD_CLIENTS`（逗号分隔）里；**这个设置为空则接口不存在（404）**。成员的令牌（`azp` 不在名单里、有会话、是委托）是 403，无效的令牌是 401。**名单里只放专用的服务客户端**，不要放 Workspace 或任何会签发成员令牌的客户端。幂等：重复调用、成员没有授权都是 200。答案：`{"grants_removed":1,"revocations_failed":0,"reviewer_grants_marked":0}`，只有计数。处理与 `revoke` 命令相同：每个连接上先撤销刷新令牌再撤销访问令牌（授权服务器能撤销的，GitHub 见 5.10），删除授权和未完成的授权，标记他授权的评审账号。审计一行（`event: offboard`，租户、成员的哈希前缀、原因、来源、调用方 `azp`、计数），计数器 `idp_bridge_offboard_total{reason,source}` 等。
+
+**2. 对账**（兜底，每 `IDP_BRIDGE_RECONCILE_INTERVAL` 一轮，缺省 15 分钟，`0` 关闭）：需要目录适配器：`IDP_BRIDGE_DIRECTORY=none`（缺省，不对账）或 `keycloak-dev`（**只用于开发测试**，启动日志会说明）。每轮把库里每个（租户、成员）交给目录，结果五种：仍在、已停用、已删除、换了租户、查不清。**只有明确结果才动**：停用、删除、换租户按"离开"处理；查不清（超时、出错、没权限、应答不像用户）一律不动，下一轮再查。**安全闸**：一轮里判定离开的成员**不少于 5 人且多于已知成员的 20%**，这一轮整个不执行，日志里一条 ERROR（`reconciliation brake`）和计数器 `idp_bridge_reconcile_brake_total`；运维到目录那边核对之后，`idp-mcp-bridge reconcile --now --force` 越过。`reconcile --now` 立即跑一轮（仍受闸约束）。同一时刻只有一个副本在对账（PostgreSQL 咨询锁），别的副本那一轮是 `busy`。计数器：`idp_bridge_reconcile_rounds_total{result}`（done、braked、busy）、`_lookups_total{status}`、`_offboarded_total{reason}`。
+
+**Keycloak 开发适配器**（`IDP_BRIDGE_DIRECTORY=keycloak-dev`）：一个带**服务账号**的保密客户端（给它 realm 的 `view-users` 角色，别的不要），设置 `IDP_BRIDGE_KEYCLOAK_URL`、`IDP_BRIDGE_KEYCLOAK_REALM`、`IDP_BRIDGE_KEYCLOAK_CLIENT_ID`、`IDP_BRIDGE_KEYCLOAK_CLIENT_SECRET_FILE`（挂载的 Secret）、`IDP_BRIDGE_KEYCLOAK_TENANT_ATTRIBUTE`（缺省 `tenant_id`）；URL 要 https（集群内只有 http 的设 `IDP_BRIDGE_OIDC_ALLOW_HTTP=true`，同 JWKS）。它用客户端凭据取令牌，`GET /admin/realms/{realm}/users/{sub}`：404 且是 `User not found` → 已删除；`enabled: false` → 已停用；租户属性不是授权的租户 → 换了租户；别的都是查不清。出口策略放行到 Keycloak 已经有（`bridge-keycloak`）。最终的身份系统定了以后换一个适配器（SCIM 的 `GET /Users/{id}` 等），其余不变。
+
+**3. 评审账号的授权人离开**：评审账号**保留**（撤掉它会让这个服务对所有成员不可用），在运维看到的列表里 `reviewer` 是 `{"status":"connected","reason":"authorizer_left"}`，日志一条 WARN（`re-authorize it`）、计数器 `idp_bridge_reviewer_authorizer_left_total`；由别的运维重新授权（5.6）即清除。**对账也会发现**自己没有任何成员授权、只授权了评审账号的运维离开：一轮对账会把评审授权里的授权人（`authorized_by`，`租户/成员`）也交给目录，他离开时只标记账号；这些人与成员一起计入安全闸。
+
+**4. 重新启用不会自动恢复**：授权已经删除，成员回来以后要重新连接。**5. 平台的"成员生命周期"入口**（SCIM 或 SSF 的推送，实时性由它提供）等最终身份系统定了再做。
+
+### 5.10 GitHub 的撤销（`revocation: github`）
+
+连接配置 `authorization.revocation: github`，**只对预注册的客户端**（GitHub App 或 OAuth App 的客户端 id 与密钥）。断开、再授权、成员离开（接口与对账）、`revoke`、评审账号的断开都调用 GitHub 自己的接口：`DELETE https://api.github.com/applications/{client_id}/grant`（Basic `client_id:client_secret`，正文 `{"access_token": ...}`，`Accept: application/vnd.github+json`，`X-GitHub-Api-Version: 2022-11-28`）删除这个用户对这个应用的整个授权；204 是已撤销，404 与 422 当作已经没有了，别的（5xx、401、403）算失败，失败时再试 `DELETE .../applications/{client_id}/token`；两个都失败：授权照样删除，日志里写状态码，成员的列表里这条连接是"未连接，撤销未确认"（`revocation_unconfirmed`），提示成员到 GitHub 的 Settings → Applications 自己撤销。**再授权时只撤被取代的那个访问令牌**（`/token`），不用 `/grant`：同一用户对同一应用只有一个授权，删了它新令牌也没了。访问令牌已经过期而有刷新令牌时，桥先刷新一次再出示新令牌（这个接口靠一个它认得的访问令牌指出授权）。
+
+**未核实（下一次真实 GitHub 验证时实测）**：GitHub 现行文档说 OAuth App 与 GitHub App 的所有者都能用 `/grant`，旧版文档说它不适用于 GitHub App 的用户令牌。要看：`/grant` 对 GitHub App 的用户令牌是否答 204；答 404/422 时刷新令牌是否真的失效；`/token` 是否让刷新令牌一起失效。不行的话 GitHub 的授权无法由桥撤销，状态会如实显示"撤销未确认"。
 
 ## 6. 轮换
 

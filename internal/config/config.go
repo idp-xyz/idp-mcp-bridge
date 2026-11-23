@@ -32,6 +32,9 @@ const (
 	AuthOAuth = "oauth"
 )
 
+// RevocationGitHub is Authorization.Revocation for GitHub's own revocation API.
+const RevocationGitHub = "github"
+
 // Client identity modes (idp-mcp-bridge-oauth-plan.md section 1, item 2).
 const (
 	// ClientCIMD: the client_id is an https address of a client metadata document the bridge's operator hosts.
@@ -100,6 +103,9 @@ type Authorization struct {
 	// metadata (the MCP specification's SHOULD). Off by default: an operator who lists no scopes gets none requested, never everything
 	// the third party offers (ADR-0001 D37).
 	ScopesFromResource bool `yaml:"scopesFromResource"`
+	// Revocation says how the member's tokens are revoked at the third party: "" is RFC 7009 at the server's revocation endpoint, if
+	// it has one; "github" is GitHub's application grant API with the preregistered client's id and secret (ADR-0001 D42).
+	Revocation string `yaml:"revocation"`
 }
 
 // Client is the bridge's identity at the authorization server.
@@ -258,7 +264,7 @@ func publicHTTPS(key, raw string, o Options, query bool) (addr.Address, error) {
 func (a *Authorization) validate(o Options) error {
 	switch a.Mode {
 	case AuthNone:
-		if a.Issuer != "" || a.Client != (Client{}) || len(a.Scopes) > 0 || len(a.ReviewerScopes) > 0 || a.ScopesFromResource {
+		if a.Issuer != "" || a.Client != (Client{}) || len(a.Scopes) > 0 || len(a.ReviewerScopes) > 0 || a.ScopesFromResource || a.Revocation != "" {
 			return errors.New("mode none takes no issuer, client or scopes: they would be ignored, and an ignored line is a wrong belief")
 		}
 		return nil
@@ -277,6 +283,15 @@ func (a *Authorization) validate(o Options) error {
 	}
 	if err := a.Client.validate(o); err != nil {
 		return fmt.Errorf("client: %w", err)
+	}
+	switch a.Revocation {
+	case "":
+	case RevocationGitHub:
+		if a.Client.Mode != ClientPreregistered {
+			return errors.New("revocation: github needs a preregistered client: the application's id and secret are what GitHub's API authenticates")
+		}
+	default:
+		return fmt.Errorf("revocation %q is not github (or omitted)", a.Revocation)
 	}
 	for _, list := range []struct {
 		key    string

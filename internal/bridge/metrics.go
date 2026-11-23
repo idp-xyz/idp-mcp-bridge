@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -17,11 +18,12 @@ type Metrics struct {
 	nanos  map[string]int64
 	bytes  map[string]int64
 	states map[string]func() int
+	named  map[string]int64
 }
 
 // NewMetrics makes an empty set.
 func NewMetrics() *Metrics {
-	return &Metrics{counts: map[[2]string]int64{}, nanos: map[string]int64{}, bytes: map[string]int64{}, states: map[string]func() int{}}
+	return &Metrics{counts: map[[2]string]int64{}, nanos: map[string]int64{}, bytes: map[string]int64{}, states: map[string]func() int{}, named: map[string]int64{}}
 }
 
 // Observe counts one call (or listing) of a connection.
@@ -30,6 +32,25 @@ func (m *Metrics) Observe(connection, outcome string, d time.Duration, bytes int
 	m.counts[[2]string{connection, outcome}]++
 	m.nanos[connection] += d.Nanoseconds()
 	m.bytes[connection] += bytes
+	m.mu.Unlock()
+}
+
+// Inc counts something that is not a call: offboarding, reconciliation (labels are name, value pairs, from fixed sets).
+func (m *Metrics) Inc(name string, n int, labels ...string) {
+	var b strings.Builder
+	b.WriteString("idp_bridge_" + name)
+	if len(labels) > 1 {
+		b.WriteString("{")
+		for i := 0; i+1 < len(labels); i += 2 {
+			if i > 0 {
+				b.WriteString(",")
+			}
+			fmt.Fprintf(&b, "%s=%q", labels[i], labels[i+1])
+		}
+		b.WriteString("}")
+	}
+	m.mu.Lock()
+	m.named[b.String()] += int64(n)
 	m.mu.Unlock()
 }
 
@@ -73,6 +94,14 @@ func (m *Metrics) Write(w io.Writer) {
 	fmt.Fprintln(w, "# TYPE idp_bridge_result_bytes_total counter")
 	for _, c := range names(m.bytes) {
 		fmt.Fprintf(w, "idp_bridge_result_bytes_total{connection=%q} %d\n", c, m.bytes[c])
+	}
+	ns := make([]string, 0, len(m.named))
+	for k := range m.named {
+		ns = append(ns, k)
+	}
+	sort.Strings(ns)
+	for _, k := range ns {
+		fmt.Fprintf(w, "%s %d\n", k, m.named[k])
 	}
 	fmt.Fprintln(w, "# TYPE idp_bridge_breaker_state gauge")
 	gs := make([]string, 0, len(m.states))

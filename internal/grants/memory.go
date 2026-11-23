@@ -16,11 +16,13 @@ type Memory struct {
 	locks  map[Key]*sync.Mutex
 	states map[string]State
 	regs   map[[3]string]Registration
+	unconf map[Key]time.Time
+	locked map[int64]bool
 }
 
 // NewMemory makes an empty store.
 func NewMemory() *Memory {
-	return &Memory{grants: map[Key]Grant{}, locks: map[Key]*sync.Mutex{}, states: map[string]State{}, regs: map[[3]string]Registration{}}
+	return &Memory{grants: map[Key]Grant{}, locks: map[Key]*sync.Mutex{}, states: map[string]State{}, regs: map[[3]string]Registration{}, unconf: map[Key]time.Time{}, locked: map[int64]bool{}}
 }
 
 func clone(g Grant) Grant {
@@ -211,5 +213,103 @@ func (m *Memory) Registrations(_ context.Context) ([]Registration, error) {
 	for _, r := range m.regs {
 		out = append(out, r)
 	}
+	return out, nil
+}
+
+func (m *Memory) DeleteMemberStates(_ context.Context, tenant, member string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for h, s := range m.states {
+		if s.Tenant == tenant && s.Member == member {
+			delete(m.states, h)
+			n++
+		}
+	}
+	return n, nil
+}
+
+func (m *Memory) Members(_ context.Context) ([][2]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	seen := map[[2]string]bool{}
+	var out [][2]string
+	for k := range m.grants {
+		if k.Reviewer {
+			continue
+		}
+		if p := [2]string{k.Tenant, k.Member}; !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i][0]+"\x00"+out[i][1] < out[j][0]+"\x00"+out[j][1] })
+	return out, nil
+}
+
+func (m *Memory) MarkAuthorizerLeft(_ context.Context, authorizedBy string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for k, g := range m.grants {
+		if k.Reviewer && g.AuthorizedBy == authorizedBy {
+			g.AuthorizerLeft = true
+			m.grants[k] = g
+			n++
+		}
+	}
+	return n, nil
+}
+
+func (m *Memory) PutUnconfirmed(_ context.Context, k Key, at time.Time) error {
+	m.mu.Lock()
+	m.unconf[k] = at
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *Memory) ClearUnconfirmed(_ context.Context, k Key) error {
+	m.mu.Lock()
+	delete(m.unconf, k)
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *Memory) Unconfirmed(_ context.Context, tenant, member string) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []string
+	for k := range m.unconf {
+		if k.Tenant == tenant && k.Member == member {
+			out = append(out, k.Connection)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// TryLock is shared by every user of this Memory, which is what a test of "one replica at a time" needs.
+func (m *Memory) TryLock(_ context.Context, id int64) (func(), bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.locked[id] {
+		return nil, false, nil
+	}
+	m.locked[id] = true
+	return func() { m.mu.Lock(); delete(m.locked, id); m.mu.Unlock() }, true, nil
+}
+
+func (m *Memory) Authorizers(_ context.Context) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	seen := map[string]bool{}
+	var out []string
+	for k, g := range m.grants {
+		if k.Reviewer && !g.AuthorizerLeft && g.AuthorizedBy != "" && !seen[g.AuthorizedBy] {
+			seen[g.AuthorizedBy] = true
+			out = append(out, g.AuthorizedBy)
+		}
+	}
+	sort.Strings(out)
 	return out, nil
 }

@@ -41,6 +41,10 @@ type Service struct {
 	F           *Fetcher
 	Log         *slog.Logger
 	Now         func() time.Time
+	// Counters receives the counts of what happens to members who leave (ADR-0001 D38); nil: none are kept.
+	Counters Counters
+	// GitHubAPI is the base address of GitHub's REST API, for connections with `revocation: github`; default https://api.github.com.
+	GitHubAPI string
 }
 
 func (s *Service) now() time.Time {
@@ -406,7 +410,10 @@ func (s *Service) Finish(ctx context.Context, who auth.Subject, id string, f api
 	// (ADR-0001 D35), with no row locked. Tokens the server happened to issue again are not revoked, and neither are those of an
 	// authorization server that is no longer the connection's: a token is shown only to the server that issued it.
 	if oerr == nil && old.Issuer == c.Authorization.Issuer {
-		s.revoke(ctx, who, c, old, tok.Access, tok.Refresh)
+		s.revokeWith(ctx, who, c, old, true, tok.Access, tok.Refresh)
+	}
+	if !st.Reviewer {
+		_ = s.Store.ClearUnconfirmed(ctx, key) // connected again: a revocation that could not be confirmed is no longer the member's concern
 	}
 	return nil
 }
@@ -635,8 +642,15 @@ func (s *Service) Disconnect(ctx context.Context, who auth.Subject, id string) e
 	if err != nil {
 		return err
 	}
-	s.revoke(ctx, who, c, g)
-	return s.Store.Delete(ctx, g.Key)
+	failed := s.revoke(ctx, who, c, g)
+	if err := s.Store.Delete(ctx, g.Key); err != nil {
+		return err
+	}
+	if failed > 0 {
+		// the grant is gone whatever the third party said; the member is told it could not be confirmed there (ADR-0001 D42)
+		_ = s.Store.PutUnconfirmed(ctx, g.Key, s.now())
+	}
+	return nil
 }
 
 // DisconnectReviewer removes the connection's reviewer account the way a member disconnects: revoked at the server if it can be,
@@ -667,21 +681,30 @@ func (s *Service) Revoke(ctx context.Context, g grants.Grant) {
 	}
 }
 
-func (s *Service) revoke(ctx context.Context, who auth.Subject, c config.Connection, g grants.Grant, keep ...string) {
+func (s *Service) revoke(ctx context.Context, who auth.Subject, c config.Connection, g grants.Grant, keep ...string) int {
+	return s.revokeWith(ctx, who, c, g, false, keep...)
+}
+
+// revokeWith revokes the tokens of a grant, best effort, and returns how many revocations failed (0 if there is nothing to revoke
+// them at). superseded is the revocation of tokens a new grant replaced (ADR-0001 D35), which must not touch the new grant's.
+func (s *Service) revokeWith(ctx context.Context, who auth.Subject, c config.Connection, g grants.Grant, superseded bool, keep ...string) (failed int) {
+	if c.Authorization.Revocation == config.RevocationGitHub {
+		return s.revokeGitHub(ctx, who, c, g, superseded, keep)
+	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	d, err := s.Disc.Get(ctx, c)
 	if err != nil {
 		s.logf("revocation skipped", who, c, err)
-		return
+		return 1
 	}
 	if d.AS.RevocationEndpoint == "" {
-		return
+		return 0
 	}
 	ca, err := s.clientAuth(ctx, c, d)
 	if err != nil {
 		s.logf("revocation skipped", who, c, err)
-		return
+		return 1
 	}
 	for _, t := range []struct {
 		sealed []byte
@@ -693,6 +716,7 @@ func (s *Service) revoke(ctx context.Context, who auth.Subject, c config.Connect
 		plain, err := s.Sealer.Open(t.sealed, g.Key)
 		if err != nil {
 			s.logf("revocation skipped", who, c, err)
+			failed++
 			continue
 		}
 		if slices.Contains(keep, string(plain)) {
@@ -700,8 +724,10 @@ func (s *Service) revoke(ctx context.Context, who auth.Subject, c config.Connect
 		}
 		if err := s.F.Revoke(ctx, d.AS.RevocationEndpoint, ca, string(plain), t.hint); err != nil {
 			s.logf("revocation failed", who, c, err)
+			failed++
 		}
 	}
+	return failed
 }
 
 // List is the Workspace's page for the member: each connection with its status. No token, and no address of an authorization
@@ -715,11 +741,18 @@ func (s *Service) List(ctx context.Context, who auth.Subject) ([]api.ConnectionS
 	for _, g := range gs {
 		by[g.Connection] = g
 	}
+	unconfirmed, err := s.Store.Unconfirmed(ctx, who.Tenant, who.Member)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]api.ConnectionStatus, 0, len(s.Connections))
 	for _, c := range s.Connections {
 		st := api.ConnectionStatus{ID: c.ID, Title: c.Title}
 		g, has := by[c.ID]
 		st.Status, st.Reason, st.Scope = s.statusOf(c, g, has)
+		if !has && slices.Contains(unconfirmed, c.ID) {
+			st.Reason = "revocation_unconfirmed" // disconnected, but the third party's revocation could not be confirmed
+		}
 		if who.Reviewer { // only a caller with the reviewer role sees it
 			rs := api.ReviewerStatus{Status: api.StatusNotRequired}
 			if c.Authorization.Mode == config.AuthOAuth {
@@ -749,6 +782,9 @@ func (s *Service) statusOf(c config.Connection, g grants.Grant, has bool) (statu
 		return api.StatusReauthorize, g.ReauthReason, g.Scope
 	case len(g.SealedRefresh) == 0 && !g.AccessExpires.IsZero() && !g.AccessExpires.After(s.now()):
 		return api.StatusReauthorize, "expired", g.Scope
+	}
+	if g.Reviewer && g.AuthorizerLeft {
+		return api.StatusConnected, "authorizer_left", g.Scope // it works; the operator who authorized it left (ADR-0001 D40)
 	}
 	return api.StatusConnected, "", g.Scope
 }

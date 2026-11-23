@@ -8,10 +8,13 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"idp-mcp-bridge/internal/config"
+	"idp-mcp-bridge/internal/directory"
 	"idp-mcp-bridge/internal/grants"
 	"idp-mcp-bridge/internal/oauth"
+	"idp-mcp-bridge/internal/reconcile"
 )
 
 func oauthEnv(t *testing.T) map[string]string {
@@ -146,5 +149,103 @@ func TestTheReviewerRoleHasNoDefaultAndATenantNeedsARole(t *testing.T) {
 	delete(e, "IDP_BRIDGE_REVIEWER_ROLE")
 	if _, err := loadOAuthSettings(envOf(e), nil); err == nil || !strings.Contains(err.Error(), "IDP_BRIDGE_REVIEWER_TENANT") {
 		t.Fatalf("%v", err)
+	}
+}
+
+func TestTheOffboardingAndDirectorySettingsAreCheckedAndTheRouteAndTheDirectoryAreOffByDefault(t *testing.T) {
+	o, err := loadOAuthSettings(envOf(oauthEnv(t)), nil)
+	if err != nil || len(o.offboardClients) != 0 || o.directory != "none" || o.reconcileInterval != 15*time.Minute {
+		t.Fatalf("%+v %v", o, err)
+	}
+	e := oauthEnv(t)
+	e["IDP_BRIDGE_OFFBOARD_CLIENTS"], e["IDP_BRIDGE_RECONCILE_INTERVAL"] = " lifecycle , other,,", "30s"
+	if o, err = loadOAuthSettings(envOf(e), nil); err != nil || strings.Join(o.offboardClients, ",") != "lifecycle,other" || o.reconcileInterval != 30*time.Second {
+		t.Fatalf("%+v %v", o, err)
+	}
+	if v, _ := o.verifier(); strings.Join(v.ServiceClients, ",") != "lifecycle,other" {
+		t.Fatal("the verifier does not carry the allow-list")
+	}
+	e["IDP_BRIDGE_RECONCILE_INTERVAL"] = "0"
+	if o, err = loadOAuthSettings(envOf(e), nil); err != nil || o.reconcileInterval != 0 {
+		t.Fatalf("0 is off: %v", err)
+	}
+	for _, bad := range []string{"-5m", "500ms", "soon", "15"} {
+		e["IDP_BRIDGE_RECONCILE_INTERVAL"] = bad
+		if _, err := loadOAuthSettings(envOf(e), nil); err == nil {
+			t.Errorf("%q accepted", bad)
+		}
+	}
+	kc := map[string]string{"IDP_BRIDGE_DIRECTORY": "keycloak-dev", "IDP_BRIDGE_KEYCLOAK_URL": "https://keycloak.example.com", "IDP_BRIDGE_KEYCLOAK_REALM": "idp",
+		"IDP_BRIDGE_KEYCLOAK_CLIENT_ID": "bridge-directory", "IDP_BRIDGE_KEYCLOAK_CLIENT_SECRET_FILE": "/etc/idp/kc/secret"}
+	e = oauthEnv(t)
+	for k, v := range kc {
+		e[k] = v
+	}
+	if o, err = loadOAuthSettings(envOf(e), nil); err != nil || o.keycloak.tenantAttribute != "tenant_id" || o.keycloak.realm != "idp" {
+		t.Fatalf("%+v %v", o, err)
+	}
+	for k := range kc {
+		if k == "IDP_BRIDGE_DIRECTORY" {
+			continue
+		}
+		e2 := oauthEnv(t)
+		for k2, v := range kc {
+			e2[k2] = v
+		}
+		delete(e2, k)
+		if _, err := loadOAuthSettings(envOf(e2), nil); err == nil || !strings.Contains(err.Error(), k) {
+			t.Errorf("without %s: %v", k, err)
+		}
+	}
+	e["IDP_BRIDGE_KEYCLOAK_URL"] = "http://keycloak:8080"
+	if _, err := loadOAuthSettings(envOf(e), nil); err == nil {
+		t.Error("an http Keycloak without the explicit opt-in")
+	}
+	e["IDP_BRIDGE_DIRECTORY"] = "ldap"
+	if _, err := loadOAuthSettings(envOf(e), nil); err == nil {
+		t.Error("an unknown directory")
+	}
+}
+
+type onlyDir struct{ st directory.Status }
+
+func (d onlyDir) Lookup(context.Context, string, string) (directory.Status, error) { return d.st, nil }
+
+type countOff struct{ n int }
+
+func (c *countOff) AuthorizerLeft(context.Context, string, string, string, string) (int, error) {
+	return 0, nil
+}
+
+func (c *countOff) Offboard(context.Context, oauth.OffboardRequest) (oauth.OffboardResult, error) {
+	c.n++
+	return oauth.OffboardResult{}, nil
+}
+
+func TestTheReconcileCommandRunsOneRoundAndForceGoesPastTheBrake(t *testing.T) {
+	st := grants.NewMemory()
+	for i := 0; i < 10; i++ {
+		_ = st.Put(context.Background(), grants.Grant{Key: grants.Key{Tenant: "acme", Member: string(rune('a' + i)), Connection: "notes"}})
+	}
+	off := &countOff{}
+	rc := &reconcile.Reconciler{Store: st, Dir: onlyDir{directory.Deleted}, Off: off}
+	run := func(rc *reconcile.Reconciler, args ...string) (string, error) {
+		var out bytes.Buffer
+		err := reconcileCmd(context.Background(), args, rc, &out)
+		return out.String(), err
+	}
+	if _, err := run(rc); err == nil {
+		t.Error("without --now")
+	}
+	if _, err := run(nil, "--now"); err == nil || !strings.Contains(err.Error(), "IDP_BRIDGE_DIRECTORY") {
+		t.Errorf("no directory: %v", err)
+	}
+	out, err := run(rc, "--now")
+	if err != nil || off.n != 0 || !strings.Contains(out, "brake held") {
+		t.Fatalf("%q %v (%d)", out, err, off.n)
+	}
+	out, err = run(rc, "--now", "--force")
+	if err != nil || off.n != 10 || !strings.Contains(out, "10 offboarded") {
+		t.Fatalf("%q %v (%d)", out, err, off.n)
 	}
 }

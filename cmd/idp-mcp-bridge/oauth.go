@@ -17,9 +17,12 @@ import (
 
 	"idp-mcp-bridge/internal/addr"
 	"idp-mcp-bridge/internal/config"
+	"idp-mcp-bridge/internal/directory"
+	"idp-mcp-bridge/internal/directory/keycloakdev"
 	"idp-mcp-bridge/internal/grants"
 	"idp-mcp-bridge/internal/idauth"
 	"idp-mcp-bridge/internal/oauth"
+	"idp-mcp-bridge/internal/reconcile"
 	"idp-mcp-bridge/internal/sealer"
 )
 
@@ -35,6 +38,17 @@ type oauthSettings struct {
 	caFile                                                      string
 	// the operators who may authorize reviewer accounts (ADR-0001 D33): no default, unset means no one
 	reviewerRole, reviewerTenant, rolesClaim string
+
+	// members who leave (ADR-0001 D38, D39): the services whose client-credentials tokens may call the route, and the reconciliation
+	offboardClients   []string
+	directory         string // none, or keycloak-dev
+	reconcileInterval time.Duration
+	keycloak          keycloakSettings
+}
+
+// keycloakSettings are the dev/test directory adapter's (IDP_BRIDGE_KEYCLOAK_*).
+type keycloakSettings struct {
+	url, realm, clientID, secretFile, tenantAttribute string
 }
 
 func hasOAuth(cs []config.Connection) bool {
@@ -103,6 +117,37 @@ func loadOAuthSettings(getenv func(string) string, testOrigins map[string]bool) 
 			return nil, fmt.Errorf("%s is not set: the Workspace's calls to the internal API are verified against Keycloak (ADR-0001 D28)", k)
 		}
 	}
+	for _, c := range strings.Split(getenv("IDP_BRIDGE_OFFBOARD_CLIENTS"), ",") {
+		if c = strings.TrimSpace(c); c != "" {
+			o.offboardClients = append(o.offboardClients, c)
+		}
+	}
+	o.directory = env(getenv, "IDP_BRIDGE_DIRECTORY", "none")
+	o.reconcileInterval = reconcile.DefaultInterval
+	if v := getenv("IDP_BRIDGE_RECONCILE_INTERVAL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d < 0 || (d > 0 && d < time.Second) {
+			return nil, fmt.Errorf("IDP_BRIDGE_RECONCILE_INTERVAL must be a duration of at least 1s (15m), or 0 for no reconciliation, not %q", v)
+		}
+		o.reconcileInterval = d
+	}
+	switch o.directory {
+	case "none":
+	case "keycloak-dev":
+		k := &o.keycloak
+		k.url, k.realm, k.clientID, k.secretFile = getenv("IDP_BRIDGE_KEYCLOAK_URL"), getenv("IDP_BRIDGE_KEYCLOAK_REALM"), getenv("IDP_BRIDGE_KEYCLOAK_CLIENT_ID"), getenv("IDP_BRIDGE_KEYCLOAK_CLIENT_SECRET_FILE")
+		k.tenantAttribute = env(getenv, "IDP_BRIDGE_KEYCLOAK_TENANT_ATTRIBUTE", "tenant_id")
+		for name, v := range map[string]string{"IDP_BRIDGE_KEYCLOAK_URL": k.url, "IDP_BRIDGE_KEYCLOAK_REALM": k.realm, "IDP_BRIDGE_KEYCLOAK_CLIENT_ID": k.clientID, "IDP_BRIDGE_KEYCLOAK_CLIENT_SECRET_FILE": k.secretFile} {
+			if v == "" {
+				return nil, fmt.Errorf("%s is not set: IDP_BRIDGE_DIRECTORY=keycloak-dev needs it", name)
+			}
+		}
+		if u, err := url.Parse(k.url); err != nil || u.Host == "" || u.User != nil || (u.Scheme != "https" && !(u.Scheme == "http" && o.allowHTTP)) {
+			return nil, errors.New("IDP_BRIDGE_KEYCLOAK_URL must be an https address (http only with IDP_BRIDGE_OIDC_ALLOW_HTTP=true)")
+		}
+	default:
+		return nil, fmt.Errorf("IDP_BRIDGE_DIRECTORY %q is not none or keycloak-dev", o.directory)
+	}
 	o.jwksURL = env(getenv, "IDP_BRIDGE_OIDC_JWKS_URL", strings.TrimSuffix(o.oidcIssuer, "/")+"/protocol/openid-connect/certs")
 	u, err := url.Parse(o.jwksURL)
 	if err != nil || u.Host == "" || u.User != nil || (u.Scheme != "https" && !(u.Scheme == "http" && o.allowHTTP)) {
@@ -135,7 +180,7 @@ func (o *oauthSettings) verifier() (*idauth.Verifier, error) {
 		return nil, err
 	}
 	return &idauth.Verifier{Issuer: o.oidcIssuer, Audience: o.audience, AuthorizedParty: o.workspaceClient, TenantClaim: o.tenantClaim,
-		ReviewerRole: o.reviewerRole, ReviewerTenant: o.reviewerTenant, RolesClaim: o.rolesClaim, Keys: &idauth.JWKS{URL: o.jwksURL, HTTP: hc}}, nil
+		ReviewerRole: o.reviewerRole, ReviewerTenant: o.reviewerTenant, RolesClaim: o.rolesClaim, ServiceClients: o.offboardClients, Keys: &idauth.JWKS{URL: o.jwksURL, HTTP: hc}}, nil
 }
 
 // openStore opens the store as the service role. It does not migrate and runs no DDL: the schema is the migration Job's
@@ -229,4 +274,52 @@ func resealCmd(ctx context.Context, o *oauthSettings, st grants.Store, stdout io
 	n, err := oauth.Reseal(ctx, o.keys, st)
 	fmt.Fprintf(stdout, "re-sealed %d values under key %s\n", n, o.keys.Current())
 	return err
+}
+
+// buildDirectory makes the directory the settings choose: nil for none. keycloak-dev is for development and tests, and says so.
+func (o *oauthSettings) buildDirectory(log *slog.Logger) (directory.Directory, error) {
+	if o.directory != "keycloak-dev" {
+		return nil, nil
+	}
+	b, err := os.ReadFile(o.keycloak.secretFile)
+	if err != nil || strings.TrimSpace(string(b)) == "" {
+		return nil, errors.New("IDP_BRIDGE_KEYCLOAK_CLIENT_SECRET_FILE: the file cannot be read or is empty")
+	}
+	hc, err := o.jwksClient()
+	if err != nil {
+		return nil, err
+	}
+	log.Warn("the Keycloak directory (IDP_BRIDGE_DIRECTORY=keycloak-dev) is for development and tests only: the identity system of production has its own adapter", "realm", o.keycloak.realm)
+	return keycloakdev.New(keycloakdev.Config{URL: o.keycloak.url, Realm: o.keycloak.realm, ClientID: o.keycloak.clientID,
+		ClientSecret: strings.TrimSpace(string(b)), TenantAttribute: o.keycloak.tenantAttribute, HTTP: hc})
+}
+
+// reconcileCmd is `idp-mcp-bridge reconcile --now [--force]`: one round now. --force goes past the safety brake, for an operator
+// who has looked at why so many members would be offboarded.
+func reconcileCmd(ctx context.Context, args []string, rc *reconcile.Reconciler, stdout io.Writer) error {
+	fs := flag.NewFlagSet("reconcile", flag.ContinueOnError)
+	now := fs.Bool("now", false, "run one round now")
+	force := fs.Bool("force", false, "go past the safety brake")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if !*now {
+		return errors.New("usage: reconcile --now [--force]")
+	}
+	if rc == nil {
+		return errors.New("no directory is configured (IDP_BRIDGE_DIRECTORY): there is nothing to reconcile against")
+	}
+	rep, err := rc.Round(ctx, *force)
+	if err != nil {
+		return err
+	}
+	switch {
+	case rep.Busy:
+		fmt.Fprintln(stdout, "another replica is reconciling; nothing done")
+	case rep.Braked:
+		fmt.Fprintf(stdout, "the brake held: %d of %d members would be offboarded, nothing was done (after checking the directory: reconcile --now --force)\n", rep.Leaving, rep.Members)
+	default:
+		fmt.Fprintf(stdout, "%d members seen, %d present, %d unknown, %d offboarded\n", rep.Members, rep.Present, rep.Unknown, rep.Offboarded)
+	}
+	return nil
 }

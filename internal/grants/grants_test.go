@@ -255,7 +255,7 @@ func TestMigrationsAreAppliedOnceByTheOwnerUnderALock(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	if total := counts[0] + counts[1] + counts[2] + counts[3]; total != 2 { // the two migrations, once each
+	if total := counts[0] + counts[1] + counts[2] + counts[3]; total != 3 { // the three migrations, once each
 		t.Fatalf("the migration was applied %d times in all: %v", total, counts)
 	}
 }
@@ -311,7 +311,7 @@ func TestTheServerNeverMigratesAndRefusesASchemaThatIsNotTheOneItExpects(t *test
 		t.Fatal(err)
 	}
 	defer oc.Close(ctx)
-	if _, err := oc.Exec(ctx, `DELETE FROM schema_migrations WHERE version = 2`); err != nil { // one behind
+	if _, err := oc.Exec(ctx, `DELETE FROM schema_migrations WHERE version = 3`); err != nil { // one behind
 		t.Fatal(err)
 	}
 	if _, err := grants.Open(ctx, svc); err == nil || !strings.Contains(err.Error(), "binary needs") {
@@ -324,7 +324,7 @@ func TestTheServerNeverMigratesAndRefusesASchemaThatIsNotTheOneItExpects(t *test
 		t.Fatalf("a schema older than expected: %v", err)
 	}
 	// newer than expected
-	if _, err := oc.Exec(ctx, `INSERT INTO schema_migrations (version, name) VALUES (1, 'a'), (2, 'b'), (3, 'c')`); err != nil {
+	if _, err := oc.Exec(ctx, `INSERT INTO schema_migrations (version, name) VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := grants.Open(ctx, svc); err == nil || !strings.Contains(err.Error(), "binary needs") {
@@ -424,5 +424,116 @@ func TestTheDatabaseRefusesARowThatIsNeitherAMembersNorTheConnectionsReviewer(t 
 		if err := s.Put(ctx, g); err == nil {
 			t.Errorf("%s: stored", name)
 		}
+	}
+}
+
+// What the offboarding needs of the store (ADR-0001 D38 to D41).
+func TestTheStoreKnowsWhoTheMembersAreAndForgetsAMembersPendingAuthorizationsAndMarksTheAuthorizersReviewerAccounts(t *testing.T) {
+	for name, mk := range stores(t) {
+		t.Run(name, func(t *testing.T) {
+			s, _ := mk()
+			for _, g := range []grants.Grant{grant("acme", "bob", "notes"), grant("acme", "bob", "crm"), grant("acme", "alice", "notes"), grant("other", "bob", "notes")} {
+				_ = s.Put(ctx, g)
+			}
+			rv := grant("", "", "notes")
+			rv.Key.Reviewer, rv.AuthorizedBy = true, "acme/bob"
+			_ = s.Put(ctx, rv)
+			ms, err := s.Members(ctx)
+			if err != nil || len(ms) != 3 || ms[0] != [2]string{"acme", "alice"} || ms[1] != [2]string{"acme", "bob"} || ms[2] != [2]string{"other", "bob"} {
+				t.Fatalf("the members (distinct, no reviewer account): %v %v", ms, err)
+			}
+			// pending authorizations of one member
+			for i, who := range [][2]string{{"acme", "bob"}, {"acme", "bob"}, {"acme", "alice"}} {
+				h := make([]byte, 32)
+				h[0] = byte(i + 1)
+				_ = s.PutState(ctx, grants.State{Hash: h, Key: grants.Key{Tenant: who[0], Member: who[1], Connection: "notes"}, SealedVerifier: []byte("v"), Expires: time.Now().Add(time.Minute)})
+			}
+			if n, err := s.DeleteMemberStates(ctx, "acme", "bob"); err != nil || n != 2 {
+				t.Fatalf("%d %v", n, err)
+			}
+			h := make([]byte, 32)
+			h[0] = 3
+			if _, err := s.TakeState(ctx, h, "acme", "alice"); err != nil {
+				t.Fatal("alice's pending authorization went with bob's")
+			}
+			// the authorizer left
+			if n, err := s.MarkAuthorizerLeft(ctx, "acme/bob"); err != nil || n != 1 {
+				t.Fatalf("%d %v", n, err)
+			}
+			if g, _ := s.Get(ctx, rv.Key); !g.AuthorizerLeft {
+				t.Fatal("not marked")
+			}
+			if g, _ := s.Get(ctx, grant("acme", "bob", "notes").Key); g.AuthorizerLeft {
+				t.Fatal("a member's own grant was marked")
+			}
+			if n, _ := s.MarkAuthorizerLeft(ctx, "acme/nobody"); n != 0 {
+				t.Fatalf("%d", n)
+			}
+			// a revocation that could not be confirmed
+			k := grants.Key{Tenant: "acme", Member: "bob", Connection: "notes"}
+			_ = s.PutUnconfirmed(ctx, k, time.Now())
+			_ = s.PutUnconfirmed(ctx, k, time.Now())
+			if l, err := s.Unconfirmed(ctx, "acme", "bob"); err != nil || len(l) != 1 || l[0] != "notes" {
+				t.Fatalf("%v %v", l, err)
+			}
+			if l, _ := s.Unconfirmed(ctx, "acme", "alice"); len(l) != 0 {
+				t.Fatalf("%v", l)
+			}
+			_ = s.ClearUnconfirmed(ctx, k)
+			if l, _ := s.Unconfirmed(ctx, "acme", "bob"); len(l) != 0 {
+				t.Fatalf("%v", l)
+			}
+		})
+	}
+}
+
+// One at a time, across replicas.
+func TestTheLockIsHeldByOneAtATimeAcrossReplicas(t *testing.T) {
+	for name, mk := range stores(t) {
+		t.Run(name, func(t *testing.T) {
+			s1, open := mk()
+			s2 := open()
+			rel, ok, err := s1.TryLock(ctx, 424242)
+			if err != nil || !ok {
+				t.Fatalf("%v %v", ok, err)
+			}
+			if _, ok2, err := s2.TryLock(ctx, 424242); err != nil || ok2 {
+				t.Fatalf("a second replica took the lock: %v %v", ok2, err)
+			}
+			rel3, ok3, _ := s2.TryLock(ctx, 424243)
+			if !ok3 {
+				t.Fatal("another lock is not held")
+			}
+			rel3()
+			rel()
+			rel2, ok4, err := s2.TryLock(ctx, 424242)
+			if err != nil || !ok4 {
+				t.Fatalf("not released: %v %v", ok4, err)
+			}
+			rel2()
+		})
+	}
+}
+
+func TestTheStoreListsTheAuthorizersOfReviewerAccountsThatAreNotYetMarked(t *testing.T) {
+	for name, mk := range stores(t) {
+		t.Run(name, func(t *testing.T) {
+			s, _ := mk()
+			for i, by := range []string{"acme/ops", "acme/ops", "acme/ops2", ""} {
+				rv := grant("", "", string(rune('a'+i)))
+				rv.Key.Reviewer, rv.AuthorizedBy = true, by
+				_ = s.Put(ctx, rv)
+			}
+			_ = s.Put(ctx, grant("acme", "bob", "notes")) // a member grant has no authorizer
+			if a, err := s.Authorizers(ctx); err != nil || len(a) != 2 || a[0] != "acme/ops" || a[1] != "acme/ops2" {
+				t.Fatalf("%v %v", a, err)
+			}
+			if _, err := s.MarkAuthorizerLeft(ctx, "acme/ops"); err != nil {
+				t.Fatal(err)
+			}
+			if a, _ := s.Authorizers(ctx); len(a) != 1 || a[0] != "acme/ops2" {
+				t.Fatalf("a marked account's authorizer is listed again: %v", a)
+			}
+		})
 	}
 }
